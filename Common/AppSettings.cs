@@ -7,6 +7,7 @@ public class AppSettings
     public SonarrSettings Sonarr { get; set; } = new();
     public ApolloSettings Apollo { get; set; } = new();
     public StrmSettings Strm { get; set; } = new();
+    public MissingEpisodeSettings MissingEpisode { get; set; } = new();
 }
 
 public class SonarrSettings
@@ -28,4 +29,10 @@ public class StrmSettings
     public string StreamUrlTemplate { get; set; } = "https://starlite.best/api/stream/{username}/{password}/tvshow/{imdbId}/{season}/{episode}";
     public bool ValidateUrls { get; set; } = true;
     public int ValidationTimeoutSeconds { get; set; } = 10;
+}
+
+public class MissingEpisodeSettings
+{
+    public bool Enabled { get; set; } = true;
+    public int CheckIntervalHours { get; set; } = 1;
 }

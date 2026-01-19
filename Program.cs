@@ -46,7 +46,11 @@ builder.Services.AddHttpClient<StrmFileService>(client =>
 // Register application services
 builder.Services.AddScoped<SonarrService>();
 builder.Services.AddScoped<StrmFileService>();
+builder.Services.AddScoped<MissingEpisodeService>();
 builder.Services.AddSingleton<IFileSystemService, FileSystemService>();
+
+// Register background services
+builder.Services.AddHostedService<MissingEpisodeBackgroundService>();
 
 // Add controllers and API documentation
 builder.Services.AddControllers();

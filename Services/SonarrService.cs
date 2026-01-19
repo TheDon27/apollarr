@@ -61,6 +61,68 @@ public class SonarrService
             .Unwrap();
     }
 
+    public async Task<List<Episode>> GetWantedMissingEpisodesAsync(CancellationToken cancellationToken = default)
+    {
+        var allMissingEpisodes = new List<Episode>();
+        var pageSize = 100;
+        var page = 1;
+        var hasMorePages = true;
+
+        while (hasMorePages && !cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                // Add monitored=true filter to only get monitored episodes
+                var response = await RetryPolicy.ExecuteHttpRequestWithRetryAsync(
+                    async () => await CreateSonarrRequestAsync($"/api/v3/wanted/missing?page={page}&pageSize={pageSize}&sortKey=airDateUtc&sortDirection=descending&monitored=true"),
+                    _logger,
+                    $"GetWantedMissing page {page}",
+                    maxRetries: 3)
+                    .ContinueWith(async task =>
+                    {
+                        var httpResponse = await task;
+                        var content = await httpResponse.Content.ReadAsStringAsync();
+                        return JsonSerializer.Deserialize<WantedMissingResponse>(content);
+                    })
+                    .Unwrap();
+
+                if (response == null || response.Records.Count == 0)
+                {
+                    hasMorePages = false;
+                    break;
+                }
+
+                _logger.LogInformation(
+                    "Fetched page {Page} of wanted/missing episodes: {Count} records, {Total} total",
+                    page, response.Records.Count, response.TotalRecords);
+
+                // Additional client-side filter to ensure only monitored episodes
+                var monitoredEpisodes = response.Records.Where(e => e.Monitored).ToList();
+                
+                if (monitoredEpisodes.Count != response.Records.Count)
+                {
+                    _logger.LogDebug(
+                        "Filtered {FilteredCount} unmonitored episodes from page {Page}",
+                        response.Records.Count - monitoredEpisodes.Count, page);
+                }
+
+                allMissingEpisodes.AddRange(monitoredEpisodes);
+
+                // Check if there are more pages
+                hasMorePages = page * pageSize < response.TotalRecords;
+                page++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error fetching wanted/missing episodes at page {Page}", page);
+                throw;
+            }
+        }
+
+        _logger.LogInformation("Fetched total of {Count} monitored wanted/missing episodes", allMissingEpisodes.Count);
+        return allMissingEpisodes;
+    }
+
     private async Task<HttpResponseMessage> CreateSonarrRequestAsync(string endpoint)
     {
         var url = $"{_settings.Url.TrimEnd('/')}{endpoint}";
