@@ -1,7 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Apollarr.Models;
 using Apollarr.Services;
-using System.Text.Json;
 
 namespace Apollarr.Controllers;
 
@@ -10,48 +9,44 @@ namespace Apollarr.Controllers;
 public class SonarrController : ControllerBase
 {
     private readonly ILogger<SonarrController> _logger;
-    private readonly SonarrService _sonarrService;
-    private readonly StrmFileService _strmFileService;
+    private readonly ISonarrWebhookService _webhookService;
 
     public SonarrController(
         ILogger<SonarrController> logger,
-        SonarrService sonarrService,
-        StrmFileService strmFileService)
+        ISonarrWebhookService webhookService)
     {
         _logger = logger;
-        _sonarrService = sonarrService;
-        _strmFileService = strmFileService;
+        _webhookService = webhookService;
     }
 
     [HttpPost]
     [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ErrorResponse>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType<ErrorResponse>(StatusCodes.Status500InternalServerError)]
-    public async Task<IActionResult> Post([FromBody] JsonElement payload)
+    public async Task<IActionResult> Post([FromBody] SonarrWebhook webhook)
     {
-        _logger.LogInformation("Sonarr webhook received");
-        _logger.LogDebug("Payload: {Payload}", payload.GetRawText());
+        if (!ModelState.IsValid)
+        {
+            return ValidationProblem(ModelState);
+        }
+
+        if (webhook == null || string.IsNullOrWhiteSpace(webhook.EventType))
+        {
+            _logger.LogWarning("Webhook payload missing or invalid");
+            return BadRequest(new ErrorResponse("Invalid webhook payload"));
+        }
 
         try
         {
-            var webhook = JsonSerializer.Deserialize<SonarrWebhook>(payload.GetRawText());
-            
-            if (webhook == null)
+            if (webhook.EventType.Equals("seriesAdd", StringComparison.OrdinalIgnoreCase) &&
+                webhook.Series == null)
             {
-                _logger.LogWarning("Failed to deserialize webhook payload");
-                return BadRequest(new ErrorResponse("Invalid webhook payload"));
+                _logger.LogWarning("SeriesAdd event received but series data is missing");
+                return BadRequest(new ErrorResponse("Series data missing in webhook"));
             }
 
-            _logger.LogInformation("Event type: {EventType}", webhook.EventType);
-
-            // Check if this is a seriesAdd event
-            if (webhook.EventType?.Equals("seriesAdd", StringComparison.OrdinalIgnoreCase) == true)
-            {
-                return await HandleSeriesAddEventAsync(webhook);
-            }
-
-            // For other event types, just acknowledge receipt
-            return Ok(new WebhookResponse("Webhook received", webhook.EventType));
+            var response = await _webhookService.HandleWebhookAsync(webhook, HttpContext.RequestAborted);
+            return Ok(response);
         }
         catch (Exception ex)
         {
@@ -61,42 +56,43 @@ public class SonarrController : ControllerBase
         }
     }
 
-    private async Task<IActionResult> HandleSeriesAddEventAsync(SonarrWebhook webhook)
+    [HttpPost("monitor/wanted")]
+    [ProducesResponseType<MonitorWantedResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> MonitorWanted()
     {
-        if (webhook.Series == null)
+        _logger.LogInformation("Monitor wanted/missing endpoint called");
+
+        try
         {
-            _logger.LogWarning("SeriesAdd event received but series data is missing");
-            return BadRequest(new ErrorResponse("Series data missing in webhook"));
+            var result = await _webhookService.MonitorWantedAsync(HttpContext.RequestAborted);
+            return Ok(result);
         }
-
-        _logger.LogInformation("Processing seriesAdd event for series ID: {SeriesId}, Title: {SeriesTitle}", 
-            webhook.Series.Id, webhook.Series.Title);
-
-        // Fetch full series details from Sonarr API
-        var seriesDetails = await _sonarrService.GetSeriesDetailsAsync(webhook.Series.Id);
-        
-        if (seriesDetails == null)
+        catch (Exception ex)
         {
-            _logger.LogError("Failed to fetch series details for series ID: {SeriesId}", webhook.Series.Id);
+            _logger.LogError(ex, "Error processing monitor wanted request");
             return StatusCode(StatusCodes.Status500InternalServerError, 
-                new ErrorResponse("Failed to fetch series details from Sonarr"));
+                new ErrorResponse("Error processing monitor wanted request", ex.Message));
         }
+    }
 
-        // Fetch all episodes for the series
-        var episodes = await _sonarrService.GetEpisodesForSeriesAsync(webhook.Series.Id);
-        
-        _logger.LogInformation("Series has {SeasonCount} seasons and {EpisodeCount} episodes",
-            seriesDetails.Seasons.Count, episodes.Count);
+    [HttpPost("rebuild")]
+    [ProducesResponseType<RebuildSeriesResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ErrorResponse>(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> Rebuild()
+    {
+        _logger.LogInformation("Rebuild endpoint called");
 
-        // Create .strm files for all episodes
-        await _strmFileService.CreateStrmFilesForSeriesAsync(seriesDetails, episodes);
-
-        return Ok(new WebhookResponse(
-            "SeriesAdd event processed successfully",
-            webhook.EventType,
-            webhook.Series.Id,
-            seriesDetails.Title,
-            seriesDetails.Seasons.Count,
-            episodes.Count));
+        try
+        {
+            var response = await _webhookService.RebuildSeriesAsync(HttpContext.RequestAborted);
+            return Ok(response);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing rebuild request");
+            return StatusCode(StatusCodes.Status500InternalServerError, 
+                new ErrorResponse("Error processing rebuild request", ex.Message));
+        }
     }
 }

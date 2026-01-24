@@ -1,135 +1,388 @@
-using Apollarr.Common;
 using Apollarr.Models;
-using Microsoft.Extensions.Options;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
 
 namespace Apollarr.Services;
 
-public class SonarrService
+public class SonarrService : ISonarrService
 {
-    private readonly HttpClient _httpClient;
+    private readonly SonarrApiClient _apiClient;
     private readonly ILogger<SonarrService> _logger;
-    private readonly SonarrSettings _settings;
+    private readonly ConcurrentDictionary<string, SonarrTag> _tagCache = new(StringComparer.OrdinalIgnoreCase);
 
-    public SonarrService(
-        HttpClient httpClient,
-        IOptions<AppSettings> appSettings,
-        ILogger<SonarrService> logger)
+    public SonarrService(SonarrApiClient apiClient, ILogger<SonarrService> logger)
     {
-        _httpClient = httpClient;
+        _apiClient = apiClient;
         _logger = logger;
-        _settings = appSettings.Value.Sonarr;
-
-        if (string.IsNullOrWhiteSpace(_settings.Url))
-            throw new InvalidOperationException("SONARR_URL not configured");
-        if (string.IsNullOrWhiteSpace(_settings.ApiKey))
-            throw new InvalidOperationException("SONARR_API_KEY not configured");
     }
 
-    public async Task<SonarrSeriesDetails?> GetSeriesDetailsAsync(int seriesId)
+    public async Task<SonarrSeriesDetails?> GetSeriesDetailsAsync(int seriesId, CancellationToken cancellationToken = default)
     {
-        return await RetryPolicy.ExecuteHttpRequestWithRetryAsync(
-            async () => await CreateSonarrRequestAsync($"/api/v3/series/{seriesId}"),
-            _logger,
+        return await _apiClient.GetAsync<SonarrSeriesDetails>(
+            $"/api/v3/series/{seriesId}",
             $"GetSeriesDetails for series {seriesId}",
-            _settings.MaxRetries,
-            _settings.RetryDelays,
-            new[] { HttpStatusCode.NotFound, HttpStatusCode.ServiceUnavailable })
-            .ContinueWith(async task =>
-            {
-                var response = await task;
-                var content = await response.Content.ReadAsStringAsync();
-                return JsonSerializer.Deserialize<SonarrSeriesDetails>(content);
-            })
-            .Unwrap();
+            new[] { HttpStatusCode.NotFound, HttpStatusCode.ServiceUnavailable },
+            cancellationToken);
     }
 
-    public async Task<List<Episode>> GetEpisodesForSeriesAsync(int seriesId)
+    public async Task<SonarrSeriesDetails?> TryGetSeriesDetailsAsync(int seriesId, CancellationToken cancellationToken = default)
     {
-        return await RetryPolicy.ExecuteHttpRequestWithRetryAsync(
-            async () => await CreateSonarrRequestAsync($"/api/v3/episode?seriesId={seriesId}"),
-            _logger,
-            $"GetEpisodes for series {seriesId}",
-            maxRetries: 3)
-            .ContinueWith(async task =>
+        var response = await _apiClient.SendAsync(
+            HttpMethod.Get,
+            $"/api/v3/series/{seriesId}",
+            payload: null,
+            operationName: $"TryGetSeriesDetails for series {seriesId}",
+            throwOnError: false,
+            cancellationToken: cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                var response = await task;
-                var content = await response.Content.ReadAsStringAsync();
-                return JsonSerializer.Deserialize<List<Episode>>(content) ?? new List<Episode>();
-            })
-            .Unwrap();
+                _logger.LogInformation("Series ID {SeriesId} not found (skipping)", seriesId);
+                return null;
+            }
+
+            _logger.LogWarning("Failed to fetch series ID {SeriesId}: {StatusCode}", seriesId, response.StatusCode);
+            return null;
+        }
+
+        var json = await response.Content.ReadAsStringAsync(cancellationToken);
+        return JsonSerializer.Deserialize<SonarrSeriesDetails>(json);
+    }
+
+    public async Task<List<SonarrSeriesDetails>> GetAllSeriesAsync(CancellationToken cancellationToken = default)
+    {
+        var series = await _apiClient.GetAsync<List<SonarrSeriesDetails>>(
+            "/api/v3/series",
+            "GetAllSeries",
+            cancellationToken: cancellationToken);
+
+        return series ?? new List<SonarrSeriesDetails>();
+    }
+
+    public async Task<List<Episode>> GetEpisodesForSeriesAsync(int seriesId, CancellationToken cancellationToken = default)
+    {
+        var episodes = await _apiClient.GetAsync<List<Episode>>(
+            $"/api/v3/episode?seriesId={seriesId}",
+            $"GetEpisodes for series {seriesId}",
+            cancellationToken: cancellationToken);
+
+        return episodes ?? new List<Episode>();
     }
 
     public async Task<List<Episode>> GetWantedMissingEpisodesAsync(CancellationToken cancellationToken = default)
     {
         var allMissingEpisodes = new List<Episode>();
-        var pageSize = 100;
+        const int pageSize = 100;
         var page = 1;
-        var hasMorePages = true;
 
-        while (hasMorePages && !cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
         {
-            try
+            var endpoint = $"/api/v3/wanted/missing?page={page}&pageSize={pageSize}&sortKey=airDateUtc&sortDirection=descending&monitored=true";
+            var response = await _apiClient.GetAsync<WantedMissingResponse>(
+                endpoint,
+                $"GetWantedMissing page {page}",
+                cancellationToken: cancellationToken);
+
+            if (response == null || response.Records.Count == 0)
+                break;
+
+            _logger.LogInformation(
+                "Fetched page {Page} of wanted/missing episodes: {Count} records, {Total} total",
+                page, response.Records.Count, response.TotalRecords);
+
+            // Additional client-side filter to ensure only monitored episodes
+            var monitoredEpisodes = response.Records.Where(e => e.Monitored).ToList();
+
+            if (monitoredEpisodes.Count != response.Records.Count)
             {
-                // Add monitored=true filter to only get monitored episodes
-                var response = await RetryPolicy.ExecuteHttpRequestWithRetryAsync(
-                    async () => await CreateSonarrRequestAsync($"/api/v3/wanted/missing?page={page}&pageSize={pageSize}&sortKey=airDateUtc&sortDirection=descending&monitored=true"),
-                    _logger,
-                    $"GetWantedMissing page {page}",
-                    maxRetries: 3)
-                    .ContinueWith(async task =>
-                    {
-                        var httpResponse = await task;
-                        var content = await httpResponse.Content.ReadAsStringAsync();
-                        return JsonSerializer.Deserialize<WantedMissingResponse>(content);
-                    })
-                    .Unwrap();
-
-                if (response == null || response.Records.Count == 0)
-                {
-                    hasMorePages = false;
-                    break;
-                }
-
-                _logger.LogInformation(
-                    "Fetched page {Page} of wanted/missing episodes: {Count} records, {Total} total",
-                    page, response.Records.Count, response.TotalRecords);
-
-                // Additional client-side filter to ensure only monitored episodes
-                var monitoredEpisodes = response.Records.Where(e => e.Monitored).ToList();
-                
-                if (monitoredEpisodes.Count != response.Records.Count)
-                {
-                    _logger.LogDebug(
-                        "Filtered {FilteredCount} unmonitored episodes from page {Page}",
-                        response.Records.Count - monitoredEpisodes.Count, page);
-                }
-
-                allMissingEpisodes.AddRange(monitoredEpisodes);
-
-                // Check if there are more pages
-                hasMorePages = page * pageSize < response.TotalRecords;
-                page++;
+                _logger.LogDebug(
+                    "Filtered {FilteredCount} unmonitored episodes from page {Page}",
+                    response.Records.Count - monitoredEpisodes.Count, page);
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error fetching wanted/missing episodes at page {Page}", page);
-                throw;
-            }
+
+            allMissingEpisodes.AddRange(monitoredEpisodes);
+
+            // Check if there are more pages
+            if (page * pageSize >= response.TotalRecords)
+                break;
+
+            page++;
         }
 
         _logger.LogInformation("Fetched total of {Count} monitored wanted/missing episodes", allMissingEpisodes.Count);
         return allMissingEpisodes;
     }
 
-    private async Task<HttpResponseMessage> CreateSonarrRequestAsync(string endpoint)
+    public async Task UpdateSeriesAsync(SonarrSeriesDetails series, CancellationToken cancellationToken = default)
     {
-        var url = $"{_settings.Url.TrimEnd('/')}{endpoint}";
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("X-Api-Key", _settings.ApiKey);
+        _logger.LogInformation("Updating series ID {SeriesId}", series.Id);
 
-        _logger.LogInformation("Sending request to Sonarr: {Url}", url);
-        return await _httpClient.SendAsync(request);
+        await _apiClient.SendAsync(
+            HttpMethod.Put,
+            $"/api/v3/series/{series.Id}",
+            series,
+            $"update series {series.Id}",
+            cancellationToken: cancellationToken);
+
+        _logger.LogInformation("Successfully updated series ID {SeriesId}", series.Id);
+    }
+
+    public async Task<bool> DeleteSeriesAsync(
+        int seriesId,
+        bool deleteFiles,
+        bool addImportListExclusion = false,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint =
+            $"/api/v3/series/{seriesId}?deleteFiles={deleteFiles.ToString().ToLowerInvariant()}&addImportListExclusion={addImportListExclusion.ToString().ToLowerInvariant()}";
+
+        var response = await _apiClient.SendAsync(
+            HttpMethod.Delete,
+            endpoint,
+            payload: null,
+            operationName: $"delete series {seriesId}",
+            throwOnError: false,
+            cancellationToken: cancellationToken);
+
+        if (response.IsSuccessStatusCode)
+        {
+            _logger.LogInformation("Deleted series ID {SeriesId} (deleteFiles={DeleteFiles})", seriesId, deleteFiles);
+            return true;
+        }
+
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        _logger.LogWarning(
+            "Failed to delete series ID {SeriesId}: {StatusCode} {Body}",
+            seriesId, response.StatusCode, body);
+        return false;
+    }
+
+    public async Task<SonarrSeriesDetails?> AddSeriesAsync(SonarrSeriesDetails series, CancellationToken cancellationToken = default)
+    {
+        series.AddOptions ??= new SonarrAddOptions
+        {
+            Monitor = "all",
+            SearchForMissingEpisodes = false,
+            SearchForCutoffUnmetEpisodes = false,
+            IgnoreEpisodesWithFiles = true,
+            IgnoreEpisodesWithoutFiles = false
+        };
+
+        var created = await _apiClient.SendAndReadAsync<SonarrSeriesDetails>(
+            HttpMethod.Post,
+            "/api/v3/series",
+            series,
+            $"add series {series.Id}",
+            throwOnError: false,
+            cancellationToken: cancellationToken);
+
+        if (created != null)
+        {
+            _logger.LogInformation("Added series {SeriesTitle} (ID: {SeriesId})", created.Title, created.Id);
+            return created;
+        }
+
+        _logger.LogWarning("Failed to add series {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
+        return null;
+    }
+
+    public async Task<bool> UpdateEpisodeAsync(Episode episode, CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Updating episode ID {EpisodeId} (S{Season:D2}E{Episode:D2}) monitored={Monitored}",
+            episode.Id, episode.SeasonNumber, episode.EpisodeNumber, episode.Monitored);
+
+        var response = await _apiClient.SendAsync(
+            HttpMethod.Put,
+            $"/api/v3/episode/{episode.Id}",
+            episode,
+            $"update episode {episode.Id}",
+            throwOnError: false,
+            cancellationToken: cancellationToken);
+
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            _logger.LogWarning("Episode ID {EpisodeId} not found when updating; skipping", episode.Id);
+            return false;
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            throw new HttpRequestException($"Failed to update episode {episode.Id}: {response.StatusCode} {body}");
+        }
+
+        return true;
+    }
+
+    public async Task DeleteEpisodeFileAsync(int episodeFileId, CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Deleting episode file ID {EpisodeFileId}", episodeFileId);
+
+        await _apiClient.SendAsync(
+            HttpMethod.Delete,
+            $"/api/v3/episodefile/{episodeFileId}",
+            payload: null,
+            operationName: $"delete episode file {episodeFileId}",
+            cancellationToken: cancellationToken);
+
+        _logger.LogInformation("Successfully deleted episode file ID {EpisodeFileId}", episodeFileId);
+    }
+
+    public async Task RefreshSeriesAsync(int seriesId, CancellationToken cancellationToken = default)
+    {
+        var command = new { name = "RefreshSeries", seriesId };
+
+        _logger.LogInformation("Triggering series refresh for series ID {SeriesId}", seriesId);
+
+        var response = await _apiClient.SendAsync(
+            HttpMethod.Post,
+            "/api/v3/command",
+            command,
+            $"refresh series {seriesId}",
+            throwOnError: false,
+            cancellationToken: cancellationToken);
+
+        if (response.IsSuccessStatusCode)
+        {
+            _logger.LogInformation("Successfully triggered series refresh for series ID {SeriesId}", seriesId);
+        }
+        else
+        {
+            _logger.LogWarning("Failed to trigger series refresh for series ID {SeriesId}: {StatusCode}",
+                seriesId, response.StatusCode);
+        }
+    }
+
+    public async Task RescanSeriesAsync(int seriesId, CancellationToken cancellationToken = default)
+    {
+        // Sonarr v3 command to rescan disk for a series (re-import files, including newly created .strm)
+        var command = new { name = "RescanSeries", seriesId };
+
+        _logger.LogInformation("Triggering series rescan for series ID {SeriesId}", seriesId);
+
+        var response = await _apiClient.SendAsync(
+            HttpMethod.Post,
+            "/api/v3/command",
+            command,
+            $"rescan series {seriesId}",
+            throwOnError: false,
+            cancellationToken: cancellationToken);
+
+        if (response.IsSuccessStatusCode)
+        {
+            _logger.LogInformation("Successfully triggered series rescan for series ID {SeriesId}", seriesId);
+        }
+        else
+        {
+            _logger.LogWarning("Failed to trigger series rescan for series ID {SeriesId}: {StatusCode}",
+                seriesId, response.StatusCode);
+        }
+    }
+
+
+    public async Task<List<SonarrTag>> GetAllTagsAsync(CancellationToken cancellationToken = default)
+    {
+        var tags = await _apiClient.GetAsync<List<SonarrTag>>(
+            "/api/v3/tag",
+            "GetAllTags",
+            cancellationToken: cancellationToken);
+
+        return tags ?? new List<SonarrTag>();
+    }
+
+    public async Task<SonarrTag> GetOrCreateTagAsync(string tagLabel, CancellationToken cancellationToken = default)
+    {
+        if (_tagCache.TryGetValue(tagLabel, out var cachedTag))
+        {
+            return cachedTag;
+        }
+
+        var existingTags = await GetAllTagsAsync(cancellationToken);
+        var tag = existingTags.FirstOrDefault(t => t.Label.Equals(tagLabel, StringComparison.OrdinalIgnoreCase));
+
+        if (tag != null)
+        {
+            _tagCache[tagLabel] = tag;
+            _logger.LogDebug("Tag '{TagLabel}' already exists with ID {TagId}", tagLabel, tag.Id);
+            return tag;
+        }
+
+        _logger.LogInformation("Creating new tag: {TagLabel}", tagLabel);
+        var newTag = new { label = tagLabel };
+        var createdTag = await _apiClient.SendAndReadAsync<SonarrTag>(
+            HttpMethod.Post,
+            "/api/v3/tag",
+            newTag,
+            $"create tag '{tagLabel}'",
+            cancellationToken: cancellationToken);
+
+        if (createdTag == null)
+            throw new InvalidOperationException($"Failed to create tag '{tagLabel}'");
+
+        _tagCache[tagLabel] = createdTag;
+        _logger.LogInformation("Created tag '{TagLabel}' with ID {TagId}", tagLabel, createdTag.Id);
+        return createdTag;
+    }
+
+    public async Task AddTagToEpisodeAsync(Episode episode, int tagId, CancellationToken cancellationToken = default)
+    {
+        if (episode.Tags.Contains(tagId))
+        {
+            _logger.LogDebug("Episode {EpisodeId} already has tag {TagId}", episode.Id, tagId);
+            return;
+        }
+
+        episode.Tags.Add(tagId);
+        var updated = await UpdateEpisodeAsync(episode, cancellationToken);
+        if (updated)
+        {
+            _logger.LogInformation("Added tag {TagId} to episode {EpisodeId}", tagId, episode.Id);
+        }
+        else
+        {
+            _logger.LogWarning("Skipping add tag {TagId} for episode {EpisodeId} because episode was not found", tagId, episode.Id);
+        }
+    }
+
+    public async Task RemoveTagFromEpisodeAsync(Episode episode, int tagId, CancellationToken cancellationToken = default)
+    {
+        if (!episode.Tags.Contains(tagId))
+        {
+            _logger.LogDebug("Episode {EpisodeId} does not have tag {TagId}", episode.Id, tagId);
+            return;
+        }
+
+        episode.Tags.Remove(tagId);
+        var updated = await UpdateEpisodeAsync(episode, cancellationToken);
+        if (updated)
+        {
+            _logger.LogInformation("Removed tag {TagId} from episode {EpisodeId}", tagId, episode.Id);
+        }
+        else
+        {
+            _logger.LogWarning("Skipping remove tag {TagId} for episode {EpisodeId} because episode was not found", tagId, episode.Id);
+        }
+    }
+
+    public async Task<List<Episode>> GetEpisodesByTagAsync(int tagId, CancellationToken cancellationToken = default)
+    {
+        var allSeries = await GetAllSeriesAsync(cancellationToken);
+        var taggedEpisodes = new List<Episode>();
+
+        foreach (var series in allSeries)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                break;
+
+            var episodes = await GetEpisodesForSeriesAsync(series.Id, cancellationToken);
+            var episodesWithTag = episodes.Where(e => e.Tags.Contains(tagId)).ToList();
+            taggedEpisodes.AddRange(episodesWithTag);
+        }
+
+        _logger.LogInformation("Found {Count} episodes with tag {TagId}", taggedEpisodes.Count, tagId);
+        return taggedEpisodes;
     }
 }

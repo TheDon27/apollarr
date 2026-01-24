@@ -9,13 +9,18 @@ A .NET Core Web API application that integrates with Sonarr to automatically cre
   - Fetches series details and all episodes from Sonarr API
   - Creates organized season folders
   - Generates .strm files for each episode pointing to Apollo.to streams
-- **Missing Episodes Background Service**: Automatically checks for missing episodes every hour and retries creating .strm files
-- **Episode Management**: Only creates .strm files for monitored episodes
+  - Keeps the new series, seasons, and episodes monitored
+- **Intelligent Series Monitoring**: Automatically manages series monitoring status:
+  - Continuing series remain monitored for new episodes
+  - Ended series with all episodes are set to unmonitored
+  - Ended series missing episodes remain monitored
+- **Wanted/Missing Monitor**: `/sonarr/monitor/wanted` fetches wanted/missing episodes from Sonarr, validates stream links, creates `.strm` files for valid links, and runs automatically every 15 minutes.
+- **Episode Management**: Focuses on creating/maintaining `.strm` files while leaving monitoring state intact
 - **Stream Validation**: Validates stream URLs before creating files to ensure content availability
 
 ## Requirements
 
-- .NET 10.0 SDK or later
+- .NET 8.0 SDK or later (LTS)
 - Sonarr instance with API access
 - Apollo.to account with streaming access
 
@@ -23,7 +28,7 @@ A .NET Core Web API application that integrates with Sonarr to automatically cre
 
 ### Environment Variables
 
-Create a `.env` file in the project root with the following variables:
+Create a `.env` file in the project root with the following variables (keep this file out of source control):
 
 ```env
 # Apollo.to credentials
@@ -36,6 +41,10 @@ SONARR_API_KEY=your_sonarr_api_key
 ```
 
 See `.env.example` for a template.
+
+Configuration is validated on startup; missing `SONARR_URL`, `SONARR_API_KEY`, `APOLLO_USERNAME`, or `APOLLO_PASSWORD` will prevent the API from starting so misconfigurations fail fast.
+
+In production, HTTPS redirection and HSTS are enabled by default—ensure TLS termination is configured on your ingress or reverse proxy.
 
 ### Sonarr Webhook Setup
 
@@ -92,14 +101,11 @@ dotnet test
 ## Project Structure
 
 - `Controllers/` - API controllers
-  - `SonarrController.cs` - Handles Sonarr webhooks
+  - `SonarrController.cs` - Handles Sonarr webhooks and monitoring endpoint
   - `RadarrController.cs` - Placeholder for Radarr integration
-  - `MissingEpisodesController.cs` - Manual trigger for missing episode checks
 - `Services/` - Business logic services
   - `SonarrService.cs` - Sonarr API integration
-  - `StrmFileService.cs` - .strm file creation
-  - `MissingEpisodeService.cs` - Missing episode processing logic
-  - `MissingEpisodeBackgroundService.cs` - Background service for scheduled checks
+  - `StrmFileService.cs` - .strm file creation and monitoring logic
   - `IFileSystemService.cs` - File system abstraction
 - `Models/` - Data models
   - `SonarrWebhook.cs` - Webhook payload models
@@ -127,13 +133,15 @@ dotnet test
    https://username:password@apollo.to/stream/tv/tvdbId/seasonNumber/episodeNumber
    ```
 
-## API Documentation
+## API Documentation & Observability
 
 When running in development mode, Swagger UI is available at:
 - http://localhost:8080/swagger
 
 The OpenAPI specification is available at:
 - http://localhost:8080/openapi/v1.json
+
+Each request returns or echoes an `X-Correlation-ID` header for tracing across logs and clients. Errors are returned as RFC 7807 `application/problem+json` responses and avoid logging bodies to reduce accidental exposure of sensitive data.
 
 ## Endpoints
 
@@ -154,31 +162,19 @@ Receives Sonarr webhooks and processes them based on event type.
 }
 ```
 
-### POST /MissingEpisodes/check
-Manually triggers a check for missing episodes and attempts to create .strm files for them.
+### POST /sonarr/monitor/wanted
+Fetches wanted/missing episodes from Sonarr, validates stream links, creates `.strm` files for valid links, and triggers a rescan when new files are created. Also runs every 15 minutes via the scheduler.
 
 **Response:**
 ```json
 {
-  "message": "Missing episode check completed successfully"
+  "message": "Wanted/missing monitoring completed",
+  "seriesProcessed": 3,
+  "episodesProcessed": 25,
+  "episodesWithValidLinks": 18,
+  "strmFilesCreated": 12,
+  "rescansTriggered": 2
 }
 ```
 
-## Background Services
-
-### Missing Episodes Service
-Apollarr includes a background service that automatically checks for missing episodes on a configurable interval (default: every hour). This ensures that episodes that were initially unavailable or failed to create get retried automatically.
-
-**Configuration:**
-```json
-{
-  "AppSettings": {
-    "MissingEpisode": {
-      "Enabled": true,
-      "CheckIntervalHours": 1
-    }
-  }
-}
-```
-
-For detailed information about the missing episodes feature, see [MISSING_EPISODES_FEATURE.md](MISSING_EPISODES_FEATURE.md).
+For detailed information about the monitor endpoints, see [MONITOR_ENDPOINT.md](MONITOR_ENDPOINT.md).

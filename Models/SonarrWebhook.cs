@@ -1,9 +1,11 @@
+using System.ComponentModel.DataAnnotations;
 using System.Text.Json.Serialization;
 
 namespace Apollarr.Models;
 
 public class SonarrWebhook
 {
+    [Required]
     [JsonPropertyName("eventType")]
     public string EventType { get; set; } = string.Empty;
 
