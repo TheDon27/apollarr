@@ -1,6 +1,4 @@
 using Apollarr.Models;
-using System.Net;
-
 namespace Apollarr.Services;
 
 /// <summary>
@@ -20,9 +18,4 @@ public interface ISonarrService
     Task DeleteEpisodeFileAsync(int episodeFileId, CancellationToken cancellationToken = default);
     Task RefreshSeriesAsync(int seriesId, CancellationToken cancellationToken = default);
     Task RescanSeriesAsync(int seriesId, CancellationToken cancellationToken = default);
-    Task<List<SonarrTag>> GetAllTagsAsync(CancellationToken cancellationToken = default);
-    Task<SonarrTag> GetOrCreateTagAsync(string tagLabel, CancellationToken cancellationToken = default);
-    Task AddTagToEpisodeAsync(Episode episode, int tagId, CancellationToken cancellationToken = default);
-    Task RemoveTagFromEpisodeAsync(Episode episode, int tagId, CancellationToken cancellationToken = default);
-    Task<List<Episode>> GetEpisodesByTagAsync(int tagId, CancellationToken cancellationToken = default);
 }

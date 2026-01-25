@@ -183,20 +183,18 @@ public class ValidationSchedulerService : BackgroundService
             using var scope = _serviceProvider.CreateScope();
             var strmFileService = scope.ServiceProvider.GetRequiredService<IStrmFileService>();
 
-            _logger.LogInformation("Running daily missing-only validation (tag=missing)");
+            _logger.LogInformation("Running daily episode validation");
             var result = await strmFileService.ProcessEpisodesMonitoringAsync(
-                onlyMonitored: false, 
-                tagFilter: "missing",
+                onlyMonitored: false,
                 cancellationToken: cancellationToken);
 
             _logger.LogInformation(
-                "Daily missing validation complete. Series: {SeriesProcessed}, Episodes: {EpisodesProcessed}, " +
-                "Valid Links: {ValidLinks}",
+                "Daily validation complete. Series: {SeriesProcessed}, Episodes: {EpisodesProcessed}, Valid Links: {ValidLinks}",
                 result.SeriesProcessed, result.EpisodesProcessed, result.EpisodesWithValidLinks);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error running daily missing validation");
+            _logger.LogError(ex, "Error running daily validation");
         }
     }
 
@@ -210,7 +208,6 @@ public class ValidationSchedulerService : BackgroundService
             _logger.LogInformation("Running weekly full validation (all episodes)");
             var result = await strmFileService.ProcessEpisodesMonitoringAsync(
                 onlyMonitored: false, 
-                tagFilter: null,
                 cancellationToken: cancellationToken);
 
             _logger.LogInformation(

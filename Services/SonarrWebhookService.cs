@@ -1,28 +1,23 @@
 using Apollarr.Models;
-using System.IO;
-
 namespace Apollarr.Services;
 
 /// <summary>
-/// Orchestrates Sonarr webhook and rebuild workflows so controllers stay thin.
+/// Orchestrates Sonarr webhook workflows so controllers stay thin.
 /// </summary>
 public class SonarrWebhookService : ISonarrWebhookService
 {
     private readonly ILogger<SonarrWebhookService> _logger;
     private readonly ISonarrService _sonarrService;
     private readonly IStrmFileService _strmFileService;
-    private readonly IFileSystemService _fileSystem;
 
     public SonarrWebhookService(
         ILogger<SonarrWebhookService> logger,
         ISonarrService sonarrService,
-        IStrmFileService strmFileService,
-        IFileSystemService fileSystem)
+        IStrmFileService strmFileService)
     {
         _logger = logger;
         _sonarrService = sonarrService;
         _strmFileService = strmFileService;
-        _fileSystem = fileSystem;
     }
 
     public async Task<WebhookResponse> HandleWebhookAsync(SonarrWebhook webhook, CancellationToken cancellationToken = default)
@@ -41,90 +36,6 @@ public class SonarrWebhookService : ISonarrWebhookService
 
     public Task<MonitorWantedResponse> MonitorWantedAsync(CancellationToken cancellationToken = default) =>
         _strmFileService.ProcessWantedMissingAsync(cancellationToken);
-
-    public async Task<RebuildSeriesResponse> RebuildSeriesAsync(CancellationToken cancellationToken = default)
-    {
-        _logger.LogInformation("Starting series rebuild workflow");
-        var seriesList = await _sonarrService.GetAllSeriesAsync(cancellationToken);
-
-        var seriesProcessed = 0;
-        var seriesDeleted = 0;
-        var directoriesDeleted = 0;
-        var seriesReadded = 0;
-        var errors = new List<string>();
-
-        foreach (var summary in seriesList)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            try
-            {
-                var details = await _sonarrService.GetSeriesDetailsAsync(summary.Id, cancellationToken);
-                if (details == null)
-                {
-                    errors.Add($"Series {summary.Title} ({summary.Id}): details not found");
-                    continue;
-                }
-
-                seriesProcessed++;
-
-                var originalPath = details.Path;
-                var rootFolderPath = !string.IsNullOrWhiteSpace(details.RootFolderPath)
-                    ? details.RootFolderPath
-                    : Path.GetDirectoryName(originalPath) ?? string.Empty;
-
-                var deletedFromSonarr = await _sonarrService.DeleteSeriesAsync(details.Id, deleteFiles: true, cancellationToken: cancellationToken);
-                if (deletedFromSonarr)
-                {
-                    seriesDeleted++;
-                }
-                else
-                {
-                    errors.Add($"Failed to delete series {details.Title} ({details.Id}) from Sonarr");
-                }
-
-                if (!string.IsNullOrWhiteSpace(originalPath) && _fileSystem.DirectoryExists(originalPath))
-                {
-                    _fileSystem.DeleteDirectory(originalPath, recursive: true);
-                    directoriesDeleted++;
-                }
-
-                details.RootFolderPath = rootFolderPath;
-                details.Path = string.Empty; // do not reuse old path
-                details.Monitored = true;
-                details.AddOptions = new SonarrAddOptions
-                {
-                    Monitor = "all",
-                    SearchForMissingEpisodes = false,
-                    SearchForCutoffUnmetEpisodes = false,
-                    IgnoreEpisodesWithFiles = true,
-                    IgnoreEpisodesWithoutFiles = false
-                };
-
-                var added = await _sonarrService.AddSeriesAsync(details, cancellationToken);
-                if (added != null)
-                {
-                    seriesReadded++;
-                }
-                else
-                {
-                    errors.Add($"Failed to re-add series {details.Title} ({details.Id}) to Sonarr");
-                }
-            }
-            catch (Exception ex)
-            {
-                errors.Add($"Series {summary.Title} ({summary.Id}): {ex.Message}");
-            }
-        }
-
-        return new RebuildSeriesResponse(
-            "Series rebuild completed",
-            seriesProcessed,
-            seriesDeleted,
-            directoriesDeleted,
-            seriesReadded,
-            errors);
-    }
 
     private async Task<WebhookResponse> HandleSeriesAddEventAsync(SonarrWebhook webhook, CancellationToken cancellationToken)
     {

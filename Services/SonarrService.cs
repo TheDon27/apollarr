@@ -1,5 +1,4 @@
 using Apollarr.Models;
-using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
 
@@ -9,7 +8,6 @@ public class SonarrService : ISonarrService
 {
     private readonly SonarrApiClient _apiClient;
     private readonly ILogger<SonarrService> _logger;
-    private readonly ConcurrentDictionary<string, SonarrTag> _tagCache = new(StringComparer.OrdinalIgnoreCase);
 
     public SonarrService(SonarrApiClient apiClient, ILogger<SonarrService> logger)
     {
@@ -283,106 +281,4 @@ public class SonarrService : ISonarrService
     }
 
 
-    public async Task<List<SonarrTag>> GetAllTagsAsync(CancellationToken cancellationToken = default)
-    {
-        var tags = await _apiClient.GetAsync<List<SonarrTag>>(
-            "/api/v3/tag",
-            "GetAllTags",
-            cancellationToken: cancellationToken);
-
-        return tags ?? new List<SonarrTag>();
-    }
-
-    public async Task<SonarrTag> GetOrCreateTagAsync(string tagLabel, CancellationToken cancellationToken = default)
-    {
-        if (_tagCache.TryGetValue(tagLabel, out var cachedTag))
-        {
-            return cachedTag;
-        }
-
-        var existingTags = await GetAllTagsAsync(cancellationToken);
-        var tag = existingTags.FirstOrDefault(t => t.Label.Equals(tagLabel, StringComparison.OrdinalIgnoreCase));
-
-        if (tag != null)
-        {
-            _tagCache[tagLabel] = tag;
-            _logger.LogDebug("Tag '{TagLabel}' already exists with ID {TagId}", tagLabel, tag.Id);
-            return tag;
-        }
-
-        _logger.LogInformation("Creating new tag: {TagLabel}", tagLabel);
-        var newTag = new { label = tagLabel };
-        var createdTag = await _apiClient.SendAndReadAsync<SonarrTag>(
-            HttpMethod.Post,
-            "/api/v3/tag",
-            newTag,
-            $"create tag '{tagLabel}'",
-            cancellationToken: cancellationToken);
-
-        if (createdTag == null)
-            throw new InvalidOperationException($"Failed to create tag '{tagLabel}'");
-
-        _tagCache[tagLabel] = createdTag;
-        _logger.LogInformation("Created tag '{TagLabel}' with ID {TagId}", tagLabel, createdTag.Id);
-        return createdTag;
-    }
-
-    public async Task AddTagToEpisodeAsync(Episode episode, int tagId, CancellationToken cancellationToken = default)
-    {
-        if (episode.Tags.Contains(tagId))
-        {
-            _logger.LogDebug("Episode {EpisodeId} already has tag {TagId}", episode.Id, tagId);
-            return;
-        }
-
-        episode.Tags.Add(tagId);
-        var updated = await UpdateEpisodeAsync(episode, cancellationToken);
-        if (updated)
-        {
-            _logger.LogInformation("Added tag {TagId} to episode {EpisodeId}", tagId, episode.Id);
-        }
-        else
-        {
-            _logger.LogWarning("Skipping add tag {TagId} for episode {EpisodeId} because episode was not found", tagId, episode.Id);
-        }
-    }
-
-    public async Task RemoveTagFromEpisodeAsync(Episode episode, int tagId, CancellationToken cancellationToken = default)
-    {
-        if (!episode.Tags.Contains(tagId))
-        {
-            _logger.LogDebug("Episode {EpisodeId} does not have tag {TagId}", episode.Id, tagId);
-            return;
-        }
-
-        episode.Tags.Remove(tagId);
-        var updated = await UpdateEpisodeAsync(episode, cancellationToken);
-        if (updated)
-        {
-            _logger.LogInformation("Removed tag {TagId} from episode {EpisodeId}", tagId, episode.Id);
-        }
-        else
-        {
-            _logger.LogWarning("Skipping remove tag {TagId} for episode {EpisodeId} because episode was not found", tagId, episode.Id);
-        }
-    }
-
-    public async Task<List<Episode>> GetEpisodesByTagAsync(int tagId, CancellationToken cancellationToken = default)
-    {
-        var allSeries = await GetAllSeriesAsync(cancellationToken);
-        var taggedEpisodes = new List<Episode>();
-
-        foreach (var series in allSeries)
-        {
-            if (cancellationToken.IsCancellationRequested)
-                break;
-
-            var episodes = await GetEpisodesForSeriesAsync(series.Id, cancellationToken);
-            var episodesWithTag = episodes.Where(e => e.Tags.Contains(tagId)).ToList();
-            taggedEpisodes.AddRange(episodesWithTag);
-        }
-
-        _logger.LogInformation("Found {Count} episodes with tag {TagId}", taggedEpisodes.Count, tagId);
-        return taggedEpisodes;
-    }
 }

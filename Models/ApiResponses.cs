@@ -40,32 +40,7 @@ public record MonitorSeasonsResponse(
     int SeriesProcessed,
     int SeasonsProcessed);
 
-public record UnmonitorEpisodesResponse(
-    string Message,
-    int SeriesProcessed,
-    int EpisodesProcessed,
-    int EpisodesUnmonitored);
-
-public record UnmonitorSeasonsResponse(
-    string Message,
-    int SeriesProcessed,
-    int SeasonsProcessed,
-    int SeasonsUnmonitored);
-
-public record UnmonitorSeriesResponse(
-    string Message,
-    int SeriesProcessed,
-    int SeriesUnmonitored);
-
 public record SeriesValidationResult(
     int EpisodesProcessed,
     int EpisodesWithValidLinks,
     int EpisodesMissing);
-
-public record RebuildSeriesResponse(
-    string Message,
-    int SeriesProcessed,
-    int SeriesDeleted,
-    int DirectoriesDeleted,
-    int SeriesReadded,
-    List<string> Errors);

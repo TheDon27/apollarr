@@ -75,24 +75,4 @@ public class SonarrController : ControllerBase
                 new ErrorResponse("Error processing monitor wanted request", ex.Message));
         }
     }
-
-    [HttpPost("rebuild")]
-    [ProducesResponseType<RebuildSeriesResponse>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ErrorResponse>(StatusCodes.Status500InternalServerError)]
-    public async Task<IActionResult> Rebuild()
-    {
-        _logger.LogInformation("Rebuild endpoint called");
-
-        try
-        {
-            var response = await _webhookService.RebuildSeriesAsync(HttpContext.RequestAborted);
-            return Ok(response);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing rebuild request");
-            return StatusCode(StatusCodes.Status500InternalServerError, 
-                new ErrorResponse("Error processing rebuild request", ex.Message));
-        }
-    }
 }
