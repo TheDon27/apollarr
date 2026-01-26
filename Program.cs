@@ -25,6 +25,8 @@ builder.Services.PostConfigure<AppSettings>(options =>
 {
     options.Sonarr.Url = builder.Configuration["SONARR_URL"] ?? options.Sonarr.Url;
     options.Sonarr.ApiKey = builder.Configuration["SONARR_API_KEY"] ?? options.Sonarr.ApiKey;
+    options.Radarr.Url = builder.Configuration["RADARR_URL"] ?? options.Radarr.Url;
+    options.Radarr.ApiKey = builder.Configuration["RADARR_API_KEY"] ?? options.Radarr.ApiKey;
     options.Apollo.Username = builder.Configuration["APOLLO_USERNAME"] ?? options.Apollo.Username;
     options.Apollo.Password = builder.Configuration["APOLLO_PASSWORD"] ?? options.Apollo.Password;
 });
@@ -65,13 +67,33 @@ builder.Services.AddHttpClient<SonarrApiClient>(client =>
     EnableMultipleHttp2Connections = true
 });
 
+builder.Services.AddHttpClient<RadarrApiClient>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+})
+.ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    // Increase connection pool size to handle more concurrent connections
+    MaxConnectionsPerServer = 10,
+    // Enable connection pooling
+    PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+    PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
+    // Enable keep-alive
+    KeepAlivePingDelay = TimeSpan.FromSeconds(30),
+    KeepAlivePingTimeout = TimeSpan.FromSeconds(5),
+    // DNS refresh
+    EnableMultipleHttp2Connections = true
+});
+
 // Register application services
 builder.Services.AddScoped<ISonarrService, SonarrService>();
+builder.Services.AddScoped<IRadarrService, RadarrService>();
 builder.Services.AddHttpClient<IStrmFileService, StrmFileService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(15);
 });
 builder.Services.AddScoped<ISonarrWebhookService, SonarrWebhookService>();
+builder.Services.AddScoped<IRadarrWebhookService, RadarrWebhookService>();
 builder.Services.AddSingleton<IFileSystemService, FileSystemService>();
 builder.Services.AddProblemDetails();
 

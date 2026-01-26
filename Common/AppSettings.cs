@@ -7,12 +7,27 @@ public class AppSettings
     public const string SectionName = "AppSettings";
 
     public SonarrSettings Sonarr { get; set; } = new();
+    public RadarrSettings Radarr { get; set; } = new();
     public ApolloSettings Apollo { get; set; } = new();
     public StrmSettings Strm { get; set; } = new();
     public SchedulingSettings Scheduling { get; set; } = new();
 }
 
 public class SonarrSettings
+{
+    [Required]
+    [Url]
+    public string Url { get; set; } = string.Empty;
+
+    [Required]
+    public string ApiKey { get; set; } = string.Empty;
+
+    [Range(0, 20)]
+    public int MaxRetries { get; set; } = 5;
+    public int[] RetryDelays { get; set; } = new[] { 2000, 3000, 5000, 8000, 10000 };
+}
+
+public class RadarrSettings
 {
     [Required]
     [Url]
@@ -47,12 +62,6 @@ public class StrmSettings
 
 public class SchedulingSettings
 {
-    public bool EnableDailyMissingValidation { get; set; } = true;
-    public string DailyMissingValidationTime { get; set; } = "02:00"; // 2 AM
-    public bool EnableWeeklyFullValidation { get; set; } = true;
-    public DayOfWeek WeeklyFullValidationDay { get; set; } = DayOfWeek.Sunday;
-    public string WeeklyFullValidationTime { get; set; } = "03:00"; // 3 AM
-
     // Hourly series monitoring (seriesAdd-like workflow across your library)
     public bool EnableHourlySeriesMonitoring { get; set; } = true;
 

@@ -35,41 +35,16 @@ The validation logic is reusable and handles:
 
 ### 3. Endpoints
 
-#### `/Sonarr/Monitor/episodes` (POST)
-- **Query Parameters**:
-  - `filter`: Optional, accepts `"monitored"` to process only monitored episodes
-  - `tag`: Optional, filters episodes by tag (e.g., `tag=missing`)
-- **Functionality**: Runs episode validation logic on all/filtered episodes
-- **Use Cases**:
-  - Weekly full validation: `POST /Sonarr/Monitor/episodes`
-  - Daily missing validation: `POST /Sonarr/Monitor/episodes?tag=missing`
+#### `/Sonarr` (POST webhook)
+- Handles Sonarr events (notably `seriesAdd`) and immediately validates/creates `.strm` files for the new series.
 
-#### `/Sonarr/Monitor/seasons` (POST)
-- **Query Parameters**:
-  - `filter`: Optional, accepts `"monitored"`
-- **Functionality**: Manages season monitoring state based on episode status
-- **Logic**: Season is unmonitored when all episodes have `.strm` files and are unmonitored
-
-#### `/Sonarr/Monitor/series` (POST)
-- **Query Parameters**:
-  - `filter`: Optional, accepts `"monitored"`
-- **Functionality**: Manages series monitoring state
-- **Logic**: Series is unmonitored when ended AND all episodes have `.strm` files AND all episodes are unmonitored
+#### `/Sonarr/Monitor/wanted` (POST)
+- Manually triggers the wanted/missing workflow to validate links and create `.strm` files for Sonarr’s wanted list.
 
 ### 4. Scheduled Tasks
 
-#### Daily Missing-Only Validation
-- **Schedule**: Configurable time (default: 2:00 AM daily)
-- **Action**: Runs `/Sonarr/Monitor/episodes?tag=missing`
-- **Purpose**: Recheck availability of previously missing streams
-
-#### Weekly Full Validation
-- **Schedule**: Configurable day/time (default: Sunday 3:00 AM)
-- **Action**: Runs `/Sonarr/Monitor/episodes` (all episodes)
-- **Purpose**: 
-  - Detect expired links
-  - Replace newly downloaded files
-  - Repair missing/corrupted `.strm` files
+- Hourly series monitoring (seriesAdd-like sweep across monitored series).
+- Wanted/missing monitoring on a configurable interval (default 15 minutes).
 
 ### 5. Configuration
 
@@ -79,11 +54,11 @@ Configuration is in `appsettings.json`:
 {
   "AppSettings": {
     "Scheduling": {
-      "EnableDailyMissingValidation": true,
-      "DailyMissingValidationTime": "02:00",
-      "EnableWeeklyFullValidation": true,
-      "WeeklyFullValidationDay": "Sunday",
-      "WeeklyFullValidationTime": "03:00"
+      "EnableHourlySeriesMonitoring": true,
+      "HourlySeriesMonitoringMinute": 0,
+      "HourlySeriesMonitoringOnlyMonitored": true,
+      "EnableWantedMissingMonitoring": true,
+      "WantedMissingIntervalMinutes": 15
     }
   }
 }
@@ -95,7 +70,7 @@ Configuration is in `appsettings.json`:
 
 #### `ValidationSchedulerService` (Background Service)
 - Runs scheduled tasks automatically
-- Manages daily and weekly validation cycles
+- Manages hourly series monitoring and frequent wanted/missing checks
 - Configurable via `appsettings.json`
 
 ### Enhanced Services
@@ -110,7 +85,6 @@ Added tag management methods:
 
 #### `StrmFileService`
 Enhanced methods:
-- `ProcessEpisodesMonitoringAsync(bool onlyMonitored, string? tagFilter)`: Added tag filtering
 - `ProcessSeasonsMonitoringAsync(bool onlyMonitored)`: New method for season monitoring
 - `ProcessEpisodeForMonitoringAsync()`: Updated to handle missing tags and idempotency
 
@@ -155,28 +129,14 @@ public record MonitorSeasonsResponse(
 ✅ Sonarr can continue monitoring new series while Apollarr manages .strm creation
 ✅ Only `.strm` files exist for valid episodes
 ✅ Episodes without valid streams are clearly marked with `missing` tag
-✅ System self-heals when streams become available (daily missing validation)
-✅ Expired links are detected and handled (weekly full validation)
 
 ## 🚀 Usage Examples
 
 ### Manual Endpoint Calls
 
 ```bash
-# Weekly full validation (all episodes)
-curl -X POST http://localhost:8080/Sonarr/Monitor/episodes
-
-# Daily missing validation (only missing episodes)
-curl -X POST http://localhost:8080/Sonarr/Monitor/episodes?tag=missing
-
-# Process only monitored episodes
-curl -X POST http://localhost:8080/Sonarr/Monitor/episodes?filter=monitored
-
-# Update season monitoring
-curl -X POST http://localhost:8080/Sonarr/Monitor/seasons
-
-# Update series monitoring
-curl -X POST http://localhost:8080/Sonarr/Monitor/series
+# Trigger wanted/missing validation
+curl -X POST http://localhost:8080/Sonarr/Monitor/wanted
 ```
 
 ### Webhook Setup
@@ -206,11 +166,11 @@ APOLLO_PASSWORD=your_password
       "ValidationTimeoutSeconds": 10
     },
     "Scheduling": {
-      "EnableDailyMissingValidation": true,
-      "DailyMissingValidationTime": "02:00",
-      "EnableWeeklyFullValidation": true,
-      "WeeklyFullValidationDay": "Sunday",
-      "WeeklyFullValidationTime": "03:00"
+      "EnableHourlySeriesMonitoring": true,
+      "HourlySeriesMonitoringMinute": 0,
+      "HourlySeriesMonitoringOnlyMonitored": true,
+      "EnableWantedMissingMonitoring": true,
+      "WantedMissingIntervalMinutes": 15
     }
   }
 }

@@ -12,12 +12,6 @@ public record ErrorResponse(
     string Message,
     string? Error = null);
 
-public record MonitorEpisodesResponse(
-    string Message,
-    int SeriesProcessed,
-    int EpisodesProcessed,
-    int EpisodesWithValidLinks);
-
 public record MonitorSeriesResponse(
     string Message,
     int SeriesProcessed,
@@ -44,3 +38,7 @@ public record SeriesValidationResult(
     int EpisodesProcessed,
     int EpisodesWithValidLinks,
     int EpisodesMissing);
+
+public record MovieValidationResult(
+    bool HasValidLink,
+    bool StrmFileCreated);

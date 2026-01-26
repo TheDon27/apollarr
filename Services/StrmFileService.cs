@@ -14,19 +14,21 @@ public class StrmFileService : IStrmFileService
     private readonly ApolloSettings _apolloSettings;
     private readonly StrmSettings _strmSettings;
     private readonly ISonarrService _sonarrService;
-    private const int EpisodeMonitorConcurrency = 4;
+    private readonly IRadarrService? _radarrService;
 
     public StrmFileService(
         ILogger<StrmFileService> logger,
         HttpClient httpClient,
         IFileSystemService fileSystem,
         ISonarrService sonarrService,
-        IOptions<AppSettings> appSettings)
+        IOptions<AppSettings> appSettings,
+        IRadarrService? radarrService = null)
     {
         _logger = logger;
         _httpClient = httpClient;
         _fileSystem = fileSystem;
         _sonarrService = sonarrService;
+        _radarrService = radarrService;
         _apolloSettings = appSettings.Value.Apollo;
         _strmSettings = appSettings.Value.Strm;
 
@@ -80,73 +82,6 @@ public class StrmFileService : IStrmFileService
             series.Title, episodesProcessed, episodesWithValidLinks, episodesMissing);
 
         return new SeriesValidationResult(episodesProcessed, episodesWithValidLinks, episodesMissing);
-    }
-
-    public async Task<MonitorEpisodesResponse> ProcessEpisodesMonitoringAsync(bool onlyMonitored, CancellationToken cancellationToken = default)
-    {
-        _logger.LogInformation("Starting episode monitoring process, onlyMonitored: {OnlyMonitored}", onlyMonitored);
-
-        var allSeries = await _sonarrService.GetAllSeriesAsync(cancellationToken);
-        var seriesProcessed = 0;
-        var episodesProcessed = 0;
-        var episodesWithValidLinks = 0;
-
-        var options = new ParallelOptions
-        {
-            MaxDegreeOfParallelism = EpisodeMonitorConcurrency,
-            CancellationToken = cancellationToken
-        };
-
-        await Parallel.ForEachAsync(allSeries, options, async (series, ct) =>
-        {
-            try
-            {
-                _logger.LogInformation("Processing series: {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
-
-                var episodes = await _sonarrService.GetEpisodesForSeriesAsync(series.Id, ct);
-
-                // Filter episodes based on onlyMonitored flag
-                var episodesToProcess = FilterEpisodes(episodes, onlyMonitored);
-
-                _logger.LogInformation("Found {EpisodeCount} episodes to process for series {SeriesTitle}",
-                    episodesToProcess.Count, series.Title);
-
-                var localEpisodesProcessed = 0;
-                var localEpisodesWithValidLinks = 0;
-
-                foreach (var episode in episodesToProcess)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    localEpisodesProcessed++;
-
-                    var hasValidLink = await ProcessEpisodeForMonitoringAsync(series, episode, ct);
-
-                    if (hasValidLink)
-                    {
-                        localEpisodesWithValidLinks++;
-                    }
-                }
-
-                Interlocked.Add(ref episodesProcessed, localEpisodesProcessed);
-                Interlocked.Add(ref episodesWithValidLinks, localEpisodesWithValidLinks);
-                Interlocked.Increment(ref seriesProcessed);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error processing series {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
-            }
-        });
-
-        _logger.LogInformation(
-            "Episode monitoring process complete. Series: {SeriesProcessed}, Episodes: {EpisodesProcessed}, " +
-            "Valid Links: {ValidLinks}",
-            seriesProcessed, episodesProcessed, episodesWithValidLinks);
-
-        return new MonitorEpisodesResponse(
-            "Episode monitoring process completed",
-            seriesProcessed,
-            episodesProcessed,
-            episodesWithValidLinks);
     }
 
     public async Task<MonitorSeriesResponse> ProcessSeriesMonitoringAsync(bool onlyMonitored, CancellationToken cancellationToken = default)
@@ -299,6 +234,158 @@ public class StrmFileService : IStrmFileService
             episodesWithValidLinks,
             strmFilesCreated,
             rescansTriggered);
+    }
+
+    public async Task<MonitorWantedResponse> ProcessWantedMissingMoviesAsync(CancellationToken cancellationToken = default)
+    {
+        if (_radarrService == null)
+        {
+            throw new InvalidOperationException("Radarr service is not configured");
+        }
+
+        _logger.LogInformation("Starting wanted/missing movies monitoring process");
+
+        var wantedMovies = await _radarrService.GetWantedMissingMoviesAsync(cancellationToken);
+
+        var moviesProcessed = 0;
+        var moviesWithValidLinks = 0;
+        var strmFilesCreated = 0;
+        var rescansTriggered = 0;
+
+        foreach (var movie in wantedMovies)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            moviesProcessed++;
+
+            var strmPath = GetMovieStrmPath(movie);
+            var existedBefore = _fileSystem.FileExists(strmPath);
+
+            var hasValidLink = await ProcessMovieForMonitoringAsync(movie, cancellationToken);
+
+            if (hasValidLink)
+            {
+                moviesWithValidLinks++;
+
+                if (!existedBefore && _fileSystem.FileExists(strmPath))
+                {
+                    strmFilesCreated++;
+                    await _radarrService.RescanMovieAsync(movie.Id, cancellationToken);
+                    rescansTriggered++;
+                }
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+
+        _logger.LogInformation(
+            "Wanted/missing movies monitoring complete. Movies: {MoviesProcessed}, Valid: {ValidLinks}, STRM created: {StrmCreated}, Rescans: {Rescans}",
+            moviesProcessed, moviesWithValidLinks, strmFilesCreated, rescansTriggered);
+
+        return new MonitorWantedResponse(
+            "Wanted/missing movies monitoring completed",
+            moviesProcessed,
+            moviesProcessed, // Using moviesProcessed for both series and episodes count for compatibility
+            moviesWithValidLinks,
+            strmFilesCreated,
+            rescansTriggered);
+    }
+
+    private async Task<bool> ProcessMovieForMonitoringAsync(
+        RadarrMovieDetails movie, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Skip if no IMDb ID
+            if (string.IsNullOrWhiteSpace(movie.ImdbId))
+            {
+                _logger.LogWarning("Movie {MovieTitle} has no IMDb ID, skipping", movie.Title);
+                return false;
+            }
+
+            // Build stream URL for movie (using "movie" instead of "tvshow", no season/episode)
+            var movieStreamUrlTemplate = _strmSettings.StreamUrlTemplate
+                .Replace("/tvshow/", "/movie/")
+                .Replace("/{season}/", "")
+                .Replace("/{episode}", "")
+                .Replace("{season}", "")
+                .Replace("{episode}", "");
+
+            var streamUrl = movieStreamUrlTemplate
+                .Replace("{username}", _apolloSettings.Username)
+                .Replace("{password}", _apolloSettings.Password)
+                .Replace("{imdbId}", movie.ImdbId);
+
+            // Validate the stream URL
+            var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
+
+            if (!isValid)
+            {
+                _logger.LogInformation(
+                    "Movie {MovieTitle} has no valid link; checking for existing .strm to clean up",
+                    movie.Title);
+
+                // Delete .strm file if it exists
+                var strmFilePath = GetMovieStrmPath(movie);
+
+                if (_fileSystem.FileExists(strmFilePath))
+                {
+                    _fileSystem.DeleteFile(strmFilePath);
+                    _logger.LogInformation("Deleted .strm file for missing movie: {FilePath}", strmFilePath);
+                }
+                else
+                {
+                    _logger.LogDebug("No .strm file found to delete for missing movie at {FilePath}", strmFilePath);
+                }
+
+                return false;
+            }
+
+            _logger.LogInformation("Movie {MovieTitle} has valid link, processing", movie.Title);
+
+            // Check if .strm file already exists (idempotent)
+            var strmFilePathValid = GetMovieStrmPath(movie);
+
+            if (_fileSystem.FileExists(strmFilePathValid))
+            {
+                _logger.LogDebug(".strm file already exists for {MovieTitle}, skipping", movie.Title);
+                return true;
+            }
+
+            // Delete existing non-.strm files if they exist
+            if (movie.HasFile && movie.MovieFile != null && movie.MovieFile.Id > 0)
+            {
+                _logger.LogInformation("Movie {MovieTitle} has existing file (ID: {FileId}), deleting to replace with .strm",
+                    movie.Title, movie.MovieFile.Id);
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                await _radarrService!.DeleteMovieFileAsync(movie.MovieFile.Id, cancellationToken);
+            }
+
+            // Ensure movie directory exists
+            if (!_fileSystem.DirectoryExists(movie.Path))
+            {
+                _fileSystem.CreateDirectory(movie.Path);
+            }
+
+            // Create .strm file
+            await _fileSystem.WriteAllTextAsync(strmFilePathValid, streamUrl);
+            _logger.LogInformation("Created .strm file: {FilePath}", strmFilePathValid);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing movie {MovieTitle} for monitoring", movie.Title);
+            return false;
+        }
     }
 
     private static int GetLatestSeasonNumber(SonarrSeriesDetails seriesDetails)
@@ -563,26 +650,27 @@ public class StrmFileService : IStrmFileService
             // Validate the stream URL
             var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
 
-            if (!isValid)
+        if (!isValid)
+        {
+            _logger.LogInformation(
+                "Episode S{Season:D2}E{Episode:D2} has no valid link; checking for existing .strm to clean up",
+                episode.SeasonNumber, episode.EpisodeNumber);
+
+            // Delete .strm file if it exists (even if the season directory is missing)
+            var strmFilePath = GetEpisodeStrmPath(series, episode);
+
+            if (_fileSystem.FileExists(strmFilePath))
             {
-                _logger.LogInformation("Episode S{Season:D2}E{Episode:D2} has no valid link; deleting any existing .strm file", 
-                    episode.SeasonNumber, episode.EpisodeNumber);
-
-                // Delete .strm file if it exists
-                var seasonPath = GetSeasonPath(series, episode.SeasonNumber);
-                if (_fileSystem.DirectoryExists(seasonPath))
-                {
-                    var strmFilePath = GetEpisodeStrmPath(series, episode);
-
-                    if (_fileSystem.FileExists(strmFilePath))
-                    {
-                        _fileSystem.DeleteFile(strmFilePath);
-                        _logger.LogInformation("Deleted .strm file for missing episode: {FilePath}", strmFilePath);
-                    }
-                }
-
-                return false;
+                _fileSystem.DeleteFile(strmFilePath);
+                _logger.LogInformation("Deleted .strm file for missing episode: {FilePath}", strmFilePath);
             }
+            else
+            {
+                _logger.LogDebug("No .strm file found to delete for missing episode at {FilePath}", strmFilePath);
+            }
+
+            return false;
+        }
 
             _logger.LogInformation("Episode S{Season:D2}E{Episode:D2} has valid link, processing", 
                 episode.SeasonNumber, episode.EpisodeNumber);
@@ -802,6 +890,86 @@ public class StrmFileService : IStrmFileService
         var episodeTitle = GetEpisodeTitle(episode);
         var fileName = SanitizeFileName($"{series.Title} - S{episode.SeasonNumber:D2}E{episode.EpisodeNumber:D2} - {episodeTitle}.strm");
         return Path.Combine(GetSeasonPath(series, episode.SeasonNumber), fileName);
+    }
+
+    public async Task<MovieValidationResult> ProcessMovieAsync(RadarrMovieDetails movie, CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Processing movie: {MovieTitle} (ID: {MovieId})", movie.Title, movie.Id);
+
+        try
+        {
+            // Validate that we have an IMDb ID
+            if (string.IsNullOrWhiteSpace(movie.ImdbId))
+            {
+                _logger.LogWarning("Movie {MovieTitle} (ID: {MovieId}) does not have an IMDb ID, skipping", movie.Title, movie.Id);
+                return new MovieValidationResult(false, false);
+            }
+
+            // Create streaming URL for movie (no season/episode)
+            // For movies, the template should be something like: https://starlite.best/api/stream/{username}/{password}/movie/{imdbId}
+            var movieStreamUrlTemplate = _strmSettings.StreamUrlTemplate
+                .Replace("/tvshow/", "/movie/")
+                .Replace("/{season}/", "")
+                .Replace("/{episode}", "")
+                .Replace("{season}", "")
+                .Replace("{episode}", "");
+
+            var streamUrl = movieStreamUrlTemplate
+                .Replace("{username}", _apolloSettings.Username)
+                .Replace("{password}", _apolloSettings.Password)
+                .Replace("{imdbId}", movie.ImdbId);
+
+            // Validate the stream URL before creating the file if enabled
+            if (_strmSettings.ValidateUrls)
+            {
+                var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
+                if (!isValid)
+                {
+                    _logger.LogWarning("Stream URL is not valid for {MovieTitle}, skipping .strm file creation", movie.Title);
+                    return new MovieValidationResult(false, false);
+                }
+            }
+
+            // Get expected .strm filename
+            var strmFilePath = GetMovieStrmPath(movie);
+
+            // Check if .strm file already exists (idempotent)
+            if (_fileSystem.FileExists(strmFilePath))
+            {
+                _logger.LogDebug(".strm file already exists for {MovieTitle}, skipping", movie.Title);
+                return new MovieValidationResult(true, false);
+            }
+
+            // Delete existing movie file if it exists
+            if (movie.HasFile && movie.MovieFile != null && movie.MovieFile.Id > 0)
+            {
+                _logger.LogInformation("Movie {MovieTitle} has existing file (ID: {FileId}), will be deleted by Radarr when .strm is created", 
+                    movie.Title, movie.MovieFile.Id);
+            }
+
+            // Ensure movie directory exists
+            if (!_fileSystem.DirectoryExists(movie.Path))
+            {
+                _fileSystem.CreateDirectory(movie.Path);
+            }
+
+            // Create .strm file
+            await _fileSystem.WriteAllTextAsync(strmFilePath, streamUrl);
+            _logger.LogInformation("Created .strm file: {FilePath}", strmFilePath);
+
+            return new MovieValidationResult(true, true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing movie {MovieTitle} (ID: {MovieId})", movie.Title, movie.Id);
+            return new MovieValidationResult(false, false);
+        }
+    }
+
+    private string GetMovieStrmPath(RadarrMovieDetails movie)
+    {
+        var fileName = SanitizeFileName($"{movie.Title} ({movie.Year}).strm");
+        return Path.Combine(movie.Path, fileName);
     }
 
     public async Task<bool> ValidateStreamUrlAsync(string streamUrl, CancellationToken cancellationToken = default)
