@@ -270,11 +270,21 @@ public class StrmFileService : IStrmFileService
             {
                 moviesWithValidLinks++;
 
+                // Only rescan if a new .strm file was actually created
+                // This matches Sonarr's behavior: only rescan when a new file needs to be imported
+                // Note: Unlike Sonarr which groups episodes by series (one rescan per series),
+                // Radarr rescans each movie individually since movies are independent entities.
+                // This means if many movies get new .strm files, there will be many rescans.
                 if (!existedBefore && _fileSystem.FileExists(strmPath))
                 {
                     strmFilesCreated++;
+                    _logger.LogDebug("New .strm file created for movie {MovieTitle} (ID: {MovieId}), triggering rescan", movie.Title, movie.Id);
                     await _radarrService.RescanMovieAsync(movie.Id, cancellationToken);
                     rescansTriggered++;
+                }
+                else if (existedBefore)
+                {
+                    _logger.LogDebug("Skipping rescan for movie {MovieTitle} (ID: {MovieId}) - .strm file already exists", movie.Title, movie.Id);
                 }
             }
 
@@ -295,6 +305,32 @@ public class StrmFileService : IStrmFileService
             moviesWithValidLinks,
             strmFilesCreated,
             rescansTriggered);
+    }
+
+    public async Task<bool> ValidateMovieLinkAsync(RadarrMovieDetails movie, CancellationToken cancellationToken = default)
+    {
+        // Skip if no IMDb ID
+        if (string.IsNullOrWhiteSpace(movie.ImdbId))
+        {
+            _logger.LogWarning("Movie {MovieTitle} has no IMDb ID, cannot validate link", movie.Title);
+            return false;
+        }
+
+        // Build stream URL for movie (using "movie" instead of "tvshow", no season/episode)
+        var movieStreamUrlTemplate = _strmSettings.StreamUrlTemplate
+            .Replace("/tvshow/", "/movie/")
+            .Replace("/{season}/", "")
+            .Replace("/{episode}", "")
+            .Replace("{season}", "")
+            .Replace("{episode}", "");
+
+        var streamUrl = movieStreamUrlTemplate
+            .Replace("{username}", _apolloSettings.Username)
+            .Replace("{password}", _apolloSettings.Password)
+            .Replace("{imdbId}", movie.ImdbId);
+
+        // Validate the stream URL
+        return await ValidateStreamUrlAsync(streamUrl, cancellationToken);
     }
 
     private async Task<bool> ProcessMovieForMonitoringAsync(

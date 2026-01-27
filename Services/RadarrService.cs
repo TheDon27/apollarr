@@ -221,4 +221,24 @@ public class RadarrService : IRadarrService
                 movieId, response.StatusCode);
         }
     }
+
+    public async Task<List<RadarrQualityProfile>> GetQualityProfilesAsync(CancellationToken cancellationToken = default)
+    {
+        var profiles = await _apiClient.GetAsync<List<RadarrQualityProfile>>(
+            "/api/v3/qualityprofile",
+            "GetQualityProfiles",
+            cancellationToken: cancellationToken);
+
+        return profiles ?? new List<RadarrQualityProfile>();
+    }
+
+    public async Task<List<RadarrMovieFile>> GetMovieFilesAsync(int movieId, CancellationToken cancellationToken = default)
+    {
+        var files = await _apiClient.GetAsync<List<RadarrMovieFile>>(
+            $"/api/v3/moviefile?movieId={movieId}",
+            $"GetMovieFiles for movie {movieId}",
+            cancellationToken: cancellationToken);
+
+        return files ?? new List<RadarrMovieFile>();
+    }
 }

@@ -77,6 +77,15 @@ public static class RetryPolicy
                     return response;
                 }
 
+                // Don't retry on authentication/authorization errors (401, 403) - they won't succeed on retry
+                if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    logger.LogError("HTTP {OperationName} returned {StatusCode} - authentication/authorization failed, not retrying",
+                        operationName, response.StatusCode);
+                    response.EnsureSuccessStatusCode(); // This will throw, but we want to fail fast
+                    return response;
+                }
+
                 // Check if we should retry on this status code
                 if (retryStatusCodes.Contains(response.StatusCode) && attempt < maxRetries)
                 {

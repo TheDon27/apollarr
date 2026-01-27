@@ -15,4 +15,5 @@ public interface IStrmFileService
     Task CreateStrmFilesForSeriesAsync(SonarrSeriesDetails series, List<Episode> episodes, CancellationToken cancellationToken = default);
     Task<bool> ValidateStreamUrlAsync(string streamUrl, CancellationToken cancellationToken = default);
     Task<MovieValidationResult> ProcessMovieAsync(RadarrMovieDetails movie, CancellationToken cancellationToken = default);
+    Task<bool> ValidateMovieLinkAsync(RadarrMovieDetails movie, CancellationToken cancellationToken = default);
 }

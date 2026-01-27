@@ -16,4 +16,6 @@ public interface IRadarrService
     Task<bool> DeleteMovieFileAsync(int movieFileId, CancellationToken cancellationToken = default);
     Task RefreshMovieAsync(int movieId, CancellationToken cancellationToken = default);
     Task RescanMovieAsync(int movieId, CancellationToken cancellationToken = default);
+    Task<List<RadarrQualityProfile>> GetQualityProfilesAsync(CancellationToken cancellationToken = default);
+    Task<List<RadarrMovieFile>> GetMovieFilesAsync(int movieId, CancellationToken cancellationToken = default);
 }

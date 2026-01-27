@@ -54,27 +54,88 @@ public class RadarrWebhookService : IRadarrWebhookService
 
         _logger.LogInformation("Movie fetched: {MovieTitle} (ID: {MovieId})", movieDetails.Title, movieDetails.Id);
 
-        // Ensure movie is monitored
+        // Step 1: Set movie to monitored and quality profile to SDTV
         movieDetails.Monitored = true;
+        
+        // Find SDTV quality profile
+        var qualityProfiles = await _radarrService.GetQualityProfilesAsync(cancellationToken);
+        var sdtvProfile = qualityProfiles.FirstOrDefault(p => 
+            p.Name.Equals("SDTV", StringComparison.OrdinalIgnoreCase));
+        
+        if (sdtvProfile != null)
+        {
+            movieDetails.QualityProfileId = sdtvProfile.Id;
+            _logger.LogInformation("Setting quality profile to SDTV (ID: {ProfileId}) for movie {MovieTitle}", 
+                sdtvProfile.Id, movieDetails.Title);
+        }
+        else
+        {
+            _logger.LogWarning("SDTV quality profile not found. Available profiles: {Profiles}", 
+                string.Join(", ", qualityProfiles.Select(p => p.Name)));
+        }
+
         await _radarrService.UpdateMovieAsync(movieDetails, cancellationToken);
+        _logger.LogInformation("Movie {MovieTitle} set to monitored with quality profile {ProfileId}", 
+            movieDetails.Title, movieDetails.QualityProfileId);
 
-        _logger.LogInformation("Movie {MovieTitle} set to monitored", movieDetails.Title);
+        // Step 2: Validate link
+        _logger.LogInformation("Validating stream link for {MovieTitle}", movieDetails.Title);
+        var hasValidLink = await _strmFileService.ValidateMovieLinkAsync(movieDetails, cancellationToken);
 
-        // Validate link and create .strm file
-        _logger.LogInformation("Starting movie validation and .strm file creation for {MovieTitle}", movieDetails.Title);
+        // Initialize validation result - will be updated if valid link exists
+        MovieValidationResult validationResult = new MovieValidationResult(hasValidLink, false);
 
-        var validationResult = await _strmFileService.ProcessMovieAsync(movieDetails, cancellationToken);
+        // Step 3: If valid link exists, delete all existing files, create .strm, and set unmonitored
+        if (hasValidLink)
+        {
+            _logger.LogInformation("Valid link found for {MovieTitle}, proceeding with file cleanup and .strm creation", 
+                movieDetails.Title);
 
-        _logger.LogInformation(
-            "MovieAdd validation complete for {MovieTitle}. Valid link: {HasValidLink}, Strm file created: {StrmCreated}",
-            movieDetails.Title, validationResult.HasValidLink, validationResult.StrmFileCreated);
+            // Delete all existing movie files first
+            var movieFiles = await _radarrService.GetMovieFilesAsync(movieDetails.Id, cancellationToken);
+            foreach (var movieFile in movieFiles)
+            {
+                _logger.LogInformation("Deleting existing movie file ID {FileId} for movie {MovieTitle}", 
+                    movieFile.Id, movieDetails.Title);
+                await _radarrService.DeleteMovieFileAsync(movieFile.Id, cancellationToken);
+            }
 
-        // Trigger rescan so Radarr imports newly created .strm file
-        await _radarrService.RescanMovieAsync(movieDetails.Id, cancellationToken);
+            // Refresh movie details to get updated state after file deletion
+            movieDetails = await _radarrService.GetMovieDetailsAsync(movieDetails.Id, cancellationToken);
+            if (movieDetails == null)
+            {
+                throw new InvalidOperationException($"Failed to refresh movie details for movie ID: {webhook.Movie.Id}");
+            }
+
+            // Create .strm file
+            validationResult = await _strmFileService.ProcessMovieAsync(movieDetails, cancellationToken);
+            
+            if (!validationResult.StrmFileCreated)
+            {
+                _logger.LogError("Failed to create .strm file for {MovieTitle}", movieDetails.Title);
+            }
+            else
+            {
+                _logger.LogInformation(".strm file created for {MovieTitle}", movieDetails.Title);
+            }
+
+            // Set movie to unmonitored
+            movieDetails.Monitored = false;
+            await _radarrService.UpdateMovieAsync(movieDetails, cancellationToken);
+            _logger.LogInformation("Movie {MovieTitle} set to unmonitored after creating .strm file", movieDetails.Title);
+
+            // Trigger rescan so Radarr imports newly created .strm file
+            await _radarrService.RescanMovieAsync(movieDetails.Id, cancellationToken);
+        }
+        else
+        {
+            _logger.LogInformation("No valid link found for {MovieTitle}, movie remains monitored", movieDetails.Title);
+        }
 
         return new WebhookResponse(
             $"MovieAdd event processed - validated {movieDetails.Title}, " +
-            $"valid link: {validationResult.HasValidLink}, strm file created: {validationResult.StrmFileCreated}",
+            $"valid link: {validationResult.HasValidLink}, strm file created: {validationResult.StrmFileCreated}, " +
+            $"monitored: {movieDetails.Monitored}",
             webhook.EventType,
             movieDetails.Id,
             movieDetails.Title);
