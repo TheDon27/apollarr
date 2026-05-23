@@ -290,15 +290,6 @@ public class Episode
     public List<int> Tags { get; set; } = new();
 }
 
-public class SonarrTag
-{
-    [JsonPropertyName("id")]
-    public int Id { get; set; }
-
-    [JsonPropertyName("label")]
-    public string Label { get; set; } = string.Empty;
-}
-
 public class SonarrAddOptions
 {
     [JsonPropertyName("monitor")]

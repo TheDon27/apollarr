@@ -128,65 +128,6 @@ public class SonarrService : ISonarrService
         _logger.LogInformation("Successfully updated series ID {SeriesId}", series.Id);
     }
 
-    public async Task<bool> DeleteSeriesAsync(
-        int seriesId,
-        bool deleteFiles,
-        bool addImportListExclusion = false,
-        CancellationToken cancellationToken = default)
-    {
-        var endpoint =
-            $"/api/v3/series/{seriesId}?deleteFiles={deleteFiles.ToString().ToLowerInvariant()}&addImportListExclusion={addImportListExclusion.ToString().ToLowerInvariant()}";
-
-        var response = await _apiClient.SendAsync(
-            HttpMethod.Delete,
-            endpoint,
-            payload: null,
-            operationName: $"delete series {seriesId}",
-            throwOnError: false,
-            cancellationToken: cancellationToken);
-
-        if (response.IsSuccessStatusCode)
-        {
-            _logger.LogInformation("Deleted series ID {SeriesId} (deleteFiles={DeleteFiles})", seriesId, deleteFiles);
-            return true;
-        }
-
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
-        _logger.LogWarning(
-            "Failed to delete series ID {SeriesId}: {StatusCode} {Body}",
-            seriesId, response.StatusCode, body);
-        return false;
-    }
-
-    public async Task<SonarrSeriesDetails?> AddSeriesAsync(SonarrSeriesDetails series, CancellationToken cancellationToken = default)
-    {
-        series.AddOptions ??= new SonarrAddOptions
-        {
-            Monitor = "all",
-            SearchForMissingEpisodes = false,
-            SearchForCutoffUnmetEpisodes = false,
-            IgnoreEpisodesWithFiles = true,
-            IgnoreEpisodesWithoutFiles = false
-        };
-
-        var created = await _apiClient.SendAndReadAsync<SonarrSeriesDetails>(
-            HttpMethod.Post,
-            "/api/v3/series",
-            series,
-            $"add series {series.Id}",
-            throwOnError: false,
-            cancellationToken: cancellationToken);
-
-        if (created != null)
-        {
-            _logger.LogInformation("Added series {SeriesTitle} (ID: {SeriesId})", created.Title, created.Id);
-            return created;
-        }
-
-        _logger.LogWarning("Failed to add series {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
-        return null;
-    }
-
     public async Task<bool> UpdateEpisodeAsync(Episode episode, CancellationToken cancellationToken = default)
     {
         _logger.LogDebug("Updating episode ID {EpisodeId} (S{Season:D2}E{Episode:D2}) monitored={Monitored}",
@@ -227,31 +168,6 @@ public class SonarrService : ISonarrService
             cancellationToken: cancellationToken);
 
         _logger.LogInformation("Successfully deleted episode file ID {EpisodeFileId}", episodeFileId);
-    }
-
-    public async Task RefreshSeriesAsync(int seriesId, CancellationToken cancellationToken = default)
-    {
-        var command = new { name = "RefreshSeries", seriesId };
-
-        _logger.LogInformation("Triggering series refresh for series ID {SeriesId}", seriesId);
-
-        var response = await _apiClient.SendAsync(
-            HttpMethod.Post,
-            "/api/v3/command",
-            command,
-            $"refresh series {seriesId}",
-            throwOnError: false,
-            cancellationToken: cancellationToken);
-
-        if (response.IsSuccessStatusCode)
-        {
-            _logger.LogInformation("Successfully triggered series refresh for series ID {SeriesId}", seriesId);
-        }
-        else
-        {
-            _logger.LogWarning("Failed to trigger series refresh for series ID {SeriesId}: {StatusCode}",
-                seriesId, response.StatusCode);
-        }
     }
 
     public async Task RescanSeriesAsync(int seriesId, CancellationToken cancellationToken = default)

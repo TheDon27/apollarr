@@ -28,8 +28,8 @@ public class ValidationSchedulerService : BackgroundService
     {
         _logger.LogInformation("Validation Scheduler Service started");
         _logger.LogInformation(
-            "Hourly series monitoring: {Enabled} at minute {Minute} (onlyMonitored={OnlyMonitored})",
-            _settings.EnableHourlySeriesMonitoring, _settings.HourlySeriesMonitoringMinute, _settings.HourlySeriesMonitoringOnlyMonitored);
+            "Series monitoring: {Enabled} every {IntervalHours}h at minute {Minute} (onlyMonitored={OnlyMonitored})",
+            _settings.EnableHourlySeriesMonitoring, _settings.SeriesMonitoringIntervalHours, _settings.HourlySeriesMonitoringMinute, _settings.HourlySeriesMonitoringOnlyMonitored);
         _logger.LogInformation(
             "Wanted/missing monitoring: {Enabled} every {Interval} minutes",
             _settings.EnableWantedMissingMonitoring, _settings.WantedMissingIntervalMinutes);
@@ -62,10 +62,13 @@ public class ValidationSchedulerService : BackgroundService
                 // Check if it's time for hourly series monitoring
                 if (_settings.EnableHourlySeriesMonitoring && !_isHourlySeriesMonitoringRunning)
                 {
+                    // Fire at the configured minute, but only once the configured interval has
+                    // elapsed since the last run. Default interval is 24h (a daily sweep), so the
+                    // full-library re-validation no longer runs every hour.
+                    var intervalHours = Math.Max(1, _settings.SeriesMonitoringIntervalHours);
                     var shouldRunThisHour = now.Minute == _settings.HourlySeriesMonitoringMinute
                                             && (_lastHourlySeriesMonitoringRun == null
-                                                || _lastHourlySeriesMonitoringRun.Value.Date != now.Date
-                                                || _lastHourlySeriesMonitoringRun.Value.Hour != now.Hour);
+                                                || now - _lastHourlySeriesMonitoringRun >= TimeSpan.FromHours(intervalHours));
 
                     if (shouldRunThisHour)
                     {
@@ -165,7 +168,7 @@ public class ValidationSchedulerService : BackgroundService
                 catch (InvalidOperationException ex) when (ex.Message.Contains("Radarr service is not configured"))
                 {
                     _logger.LogInformation("Radarr service not configured, skipping wanted/missing movies check");
-                    return (MonitorWantedResponse?)null;
+                    return (MonitorWantedMoviesResponse?)null;
                 }
             }, cancellationToken);
 
@@ -181,7 +184,7 @@ public class ValidationSchedulerService : BackgroundService
             {
                 _logger.LogInformation(
                     "Wanted/missing movies monitoring complete. Movies: {MoviesProcessed}, Valid: {ValidLinks}, STRM: {StrmCreated}, Rescans: {Rescans}",
-                    moviesResult.SeriesProcessed, moviesResult.EpisodesWithValidLinks, moviesResult.StrmFilesCreated, moviesResult.RescansTriggered);
+                    moviesResult.MoviesProcessed, moviesResult.MoviesWithValidLinks, moviesResult.StrmFilesCreated, moviesResult.RescansTriggered);
             }
         }
         catch (Exception ex)

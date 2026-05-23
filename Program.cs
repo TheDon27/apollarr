@@ -3,6 +3,7 @@ using Apollarr.Common.Middleware;
 using Apollarr.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
+using Microsoft.Extensions.Options;
 using System.Net.Http;
 
 // Load environment variables from .env file
@@ -13,12 +14,14 @@ var builder = WebApplication.CreateBuilder(args);
 // Add environment variables to configuration
 builder.Configuration.AddEnvironmentVariables();
 
-// Configure settings with validation
+// Configure settings with validation. The custom validator recurses into the nested
+// settings sections, which ValidateDataAnnotations() alone does not do.
 builder.Services
     .AddOptions<AppSettings>()
     .Bind(builder.Configuration.GetSection(AppSettings.SectionName))
-    .ValidateDataAnnotations()
     .ValidateOnStart();
+
+builder.Services.AddSingleton<IValidateOptions<AppSettings>, AppSettingsValidator>();
 
 // Override critical secrets/URLs from legacy env var names (SONARR_URL, etc.)
 builder.Services.PostConfigure<AppSettings>(options =>
@@ -95,6 +98,33 @@ builder.Services.AddHttpClient<IStrmFileService, StrmFileService>(client =>
 builder.Services.AddScoped<ISonarrWebhookService, SonarrWebhookService>();
 builder.Services.AddScoped<IRadarrWebhookService, RadarrWebhookService>();
 builder.Services.AddSingleton<IFileSystemService, FileSystemService>();
+
+// Validation cache: skips repeat HEAD validations of links that recently validated.
+// Provider is selected from config so deployments can opt into Redis without code changes.
+var validationCacheSettings = builder.Configuration
+    .GetSection(AppSettings.SectionName)
+    .GetSection(nameof(AppSettings.ValidationCache))
+    .Get<ValidationCacheSettings>() ?? new ValidationCacheSettings();
+
+if (!validationCacheSettings.Enabled)
+{
+    builder.Services.AddSingleton<IValidationCache, NullValidationCache>();
+}
+else if (validationCacheSettings.Provider.Equals("Redis", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddStackExchangeRedisCache(options =>
+    {
+        options.Configuration = validationCacheSettings.RedisConnectionString;
+        options.InstanceName = "apollarr:";
+    });
+    builder.Services.AddSingleton<IValidationCache, RedisValidationCache>();
+}
+else
+{
+    builder.Services.AddMemoryCache();
+    builder.Services.AddSingleton<IValidationCache, MemoryValidationCache>();
+}
+
 builder.Services.AddProblemDetails();
 
 // Register background services

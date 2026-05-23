@@ -29,15 +29,18 @@ public record MonitorWantedResponse(
     int StrmFilesCreated,
     int RescansTriggered);
 
-public record MonitorSeasonsResponse(
+public record MonitorWantedMoviesResponse(
     string Message,
-    int SeriesProcessed,
-    int SeasonsProcessed);
+    int MoviesProcessed,
+    int MoviesWithValidLinks,
+    int StrmFilesCreated,
+    int RescansTriggered);
 
 public record SeriesValidationResult(
     int EpisodesProcessed,
     int EpisodesWithValidLinks,
-    int EpisodesMissing);
+    int EpisodesMissing,
+    int StrmFilesCreated);
 
 public record MovieValidationResult(
     bool HasValidLink,

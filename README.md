@@ -1,28 +1,24 @@
 # Apollarr
 
-A .NET Core Web API application that integrates with Sonarr to automatically create .strm files for Apollo.to streaming.
+A .NET 8 ASP.NET Core Web API that integrates with **Sonarr** (TV) and **Radarr** (movies) to automatically create `.strm` files pointing at an external streaming provider. The default stream URL template targets `starlite.best`; streaming credentials are supplied via the `APOLLO_*` environment variables.
 
 ## Features
 
-- **Sonarr Webhook Integration**: Receives webhooks from Sonarr
-- **Automatic .strm File Creation**: When a new series is added to Sonarr (via `seriesAdd` event), Apollarr automatically:
-  - Fetches series details and all episodes from Sonarr API
-  - Creates organized season folders
-  - Generates .strm files for each episode pointing to Apollo.to streams
-  - Keeps the new series, seasons, and episodes monitored
-- **Intelligent Series Monitoring**: Automatically manages series monitoring status:
-  - Continuing series remain monitored for new episodes
-  - Ended series with all episodes are set to unmonitored
-  - Ended series missing episodes remain monitored
-- **Wanted/Missing Monitor**: `/sonarr/monitor/wanted` fetches wanted/missing episodes from Sonarr, validates stream links, creates `.strm` files for valid links, and runs automatically every 15 minutes.
-- **Episode Management**: Focuses on creating/maintaining `.strm` files while leaving monitoring state intact
-- **Stream Validation**: Validates stream URLs before creating files to ensure content availability
+- **Sonarr & Radarr Webhook Integration**: Receives webhooks from both Sonarr and Radarr.
+- **Automatic .strm File Creation**:
+  - On `seriesAdd`, Apollarr fetches the series and all episodes, monitors the series and all regular seasons (specials off), validates each episode's stream link, writes `.strm` files for valid links, and triggers a Sonarr rescan.
+  - On `movieAdd`, Apollarr sets the movie to monitored with the **SDTV** quality profile, validates the link, removes any existing movie files, writes a `.strm` file, sets the movie unmonitored, and triggers a Radarr rescan.
+- **Wanted/Missing Monitor**: `POST /sonarr/monitor/wanted` and `POST /radarr/monitor/wanted` fetch wanted/missing items from the *arr APIs, validate stream links, and create `.strm` files for valid links. These also run automatically on startup and on a configurable interval (default every 15 minutes).
+- **Scheduled Series Sweep**: An hourly background sweep re-validates monitored series and refreshes their `.strm` files.
+- **Stream Validation**: Validates stream URLs (via an HTTP `HEAD` request, treating a redirect to the provider's error page as invalid) before creating files.
+- **Idempotent & Self-Healing**: Existing `.strm` files are reused rather than recreated; rescans only fire when a new file is actually written; links that go invalid have their `.strm` files cleaned up.
 
 ## Requirements
 
 - .NET 8.0 SDK or later (LTS)
 - Sonarr instance with API access
-- Apollo.to account with streaming access
+- Radarr instance with API access (for movie support)
+- A streaming account compatible with the configured stream URL template
 
 ## Configuration
 
@@ -31,18 +27,45 @@ A .NET Core Web API application that integrates with Sonarr to automatically cre
 Create a `.env` file in the project root with the following variables (keep this file out of source control):
 
 ```env
-# Apollo.to credentials
-APOLLO_USERNAME=your_apollo_username
-APOLLO_PASSWORD=your_apollo_password
+# Streaming credentials
+APOLLO_USERNAME=your_username
+APOLLO_PASSWORD=your_password
 
 # Sonarr configuration
 SONARR_URL=http://localhost:8989
 SONARR_API_KEY=your_sonarr_api_key
+
+# Radarr configuration
+RADARR_URL=http://localhost:7878
+RADARR_API_KEY=your_radarr_api_key
 ```
 
 See `.env.example` for a template.
 
-Configuration is validated on startup; missing `SONARR_URL`, `SONARR_API_KEY`, `APOLLO_USERNAME`, or `APOLLO_PASSWORD` will prevent the API from starting so misconfigurations fail fast.
+The `APOLLO_USERNAME` and `APOLLO_PASSWORD` values are validated on startup and the API will not start without them. The Sonarr/Radarr URLs and API keys are read from these environment variables (or the `AppSettings` config section).
+
+Application behavior (stream URL template, validation, scheduling) is configured under the `AppSettings` section of `appsettings.json`:
+
+```json
+{
+  "AppSettings": {
+    "Strm": {
+      "StreamUrlTemplate": "https://starlite.best/api/stream/{username}/{password}/tvshow/{imdbId}/{season}/{episode}",
+      "ValidateUrls": true,
+      "ValidationTimeoutSeconds": 10
+    },
+    "Scheduling": {
+      "EnableHourlySeriesMonitoring": true,
+      "HourlySeriesMonitoringMinute": 0,
+      "HourlySeriesMonitoringOnlyMonitored": true,
+      "EnableWantedMissingMonitoring": true,
+      "WantedMissingIntervalMinutes": 15
+    }
+  }
+}
+```
+
+Movie stream URLs are derived from the same template by substituting `/tvshow/` with `/movie/` and dropping the season/episode segments.
 
 In production, HTTPS redirection and HSTS are enabled by default—ensure TLS termination is configured on your ingress or reverse proxy.
 
@@ -54,6 +77,17 @@ In production, HTTPS redirection and HSTS are enabled by default—ensure TLS te
    - **Name**: Apollarr
    - **On Series Add**: ✓ (checked)
    - **URL**: `http://your-apollarr-host:8080/sonarr`
+   - **Method**: POST
+4. Save the connection
+
+### Radarr Webhook Setup
+
+1. In Radarr, go to **Settings → Connect**
+2. Click the **+** button and select **Webhook**
+3. Configure the webhook:
+   - **Name**: Apollarr
+   - **On Movie Added**: ✓ (checked)
+   - **URL**: `http://your-apollarr-host:8080/radarr`
    - **Method**: POST
 4. Save the connection
 
@@ -98,40 +132,45 @@ dotnet build
 dotnet test
 ```
 
+Unit tests live in [tests/Apollarr.Tests/](tests/Apollarr.Tests/) and cover stream-URL validation, filename sanitization, configuration validation, and the Sonarr/Radarr webhook orchestration.
+
 ## Project Structure
 
 - `Controllers/` - API controllers
-  - `SonarrController.cs` - Handles Sonarr webhooks and monitoring endpoint
-  - `RadarrController.cs` - Placeholder for Radarr integration
+  - `SonarrController.cs` - Sonarr webhook + wanted/missing endpoint
+  - `RadarrController.cs` - Radarr webhook + wanted/missing endpoint
 - `Services/` - Business logic services
-  - `SonarrService.cs` - Sonarr API integration
-  - `StrmFileService.cs` - .strm file creation and monitoring logic
+  - `SonarrService.cs` / `RadarrService.cs` - *arr REST API integration
+  - `SonarrApiClient.cs` / `RadarrApiClient.cs` - Typed `HttpClient` wrappers
+  - `SonarrWebhookService.cs` / `RadarrWebhookService.cs` - Per-event orchestration
+  - `StrmFileService.cs` - `.strm` file creation, validation, and monitoring logic (TV + movies)
+  - `ValidationSchedulerService.cs` - Background service for scheduled monitoring
   - `IFileSystemService.cs` - File system abstraction
 - `Models/` - Data models
-  - `SonarrWebhook.cs` - Webhook payload models
-  - `SonarrSeriesDetails.cs` - Sonarr API response models
-  - `WantedMissing.cs` - Wanted/missing API response models
+  - `SonarrWebhook.cs` / `RadarrWebhook.cs` - Webhook payload models
+  - `SonarrSeriesDetails.cs` / `RadarrMovieDetails.cs` - *arr API response models
+  - `RadarrQualityProfile.cs` - Radarr quality profile model
+  - `WantedMissing.cs` / `WantedMissingMovies.cs` - Wanted/missing API response models
   - `ApiResponses.cs` - Standard API response DTOs
 - `Common/` - Shared utilities
   - `AppSettings.cs` - Strongly-typed configuration
   - `RetryPolicy.cs` - Centralized retry logic
+  - `Middleware/` - Correlation ID and exception-handling middleware
+- `tests/Apollarr.Tests/` - xUnit test project
 - `Program.cs` - Application entry point and configuration
 - `appsettings.json` - Application configuration
 - `Apollarr.csproj` - Project file
+- `Apollarr.sln` - Solution tying the app and test projects together
 
 ## How It Works
 
-1. **Sonarr sends webhook**: When you add a new series in Sonarr, it sends a webhook to Apollarr with `eventType: "seriesAdd"`
-2. **Apollarr fetches details**: The app queries Sonarr's API to get complete series information including all seasons and episodes
-3. **Directory creation**: Season folders are created following Sonarr's naming convention (e.g., "Season 01")
-4. **strm file generation**: For each monitored episode, a .strm file is created with the format:
-   ```
-   SeriesTitle - S01E01 - EpisodeTitle.strm
-   ```
-   The file contains the Apollo.to streaming URL:
-   ```
-   https://username:password@apollo.to/stream/tv/tvdbId/seasonNumber/episodeNumber
-   ```
+1. **An *arr app sends a webhook**: Adding a series in Sonarr (`eventType: "seriesAdd"`) or a movie in Radarr (`eventType: "movieAdd"`) triggers a webhook to Apollarr.
+2. **Apollarr fetches details**: The app queries the Sonarr/Radarr API for complete series/movie metadata, including the IMDb ID used to build the stream URL.
+3. **Stream validation**: For each episode (or movie), Apollarr builds a stream URL from the configured template and validates it with an HTTP `HEAD` request. A redirect to the provider's error page counts as invalid.
+4. **Directory + .strm file generation**: For valid links, Apollarr ensures the target directory exists and writes a `.strm` file whose contents are the stream URL.
+   - TV episodes: `Season NN/SeriesTitle - S01E01 - EpisodeTitle.strm`
+   - Movies: `MovieTitle (Year).strm`
+5. **Rescan**: When a new `.strm` file is written, Apollarr triggers a Sonarr/Radarr rescan so the file is imported. Existing files are left untouched (idempotent).
 
 ## API Documentation & Observability
 
@@ -149,21 +188,12 @@ Each request returns or echoes an `X-Correlation-ID` header for tracing across l
 Receives Sonarr webhooks and processes them based on event type.
 
 **Supported Events:**
-- `seriesAdd` - Automatically creates .strm files for all episodes in the series
+- `seriesAdd` - Monitors the series and regular seasons, validates every episode, and creates `.strm` files for valid links.
 
-**Response:**
-```json
-{
-  "message": "SeriesAdd event processed successfully",
-  "seriesId": 123,
-  "seriesTitle": "Example Series",
-  "seasonCount": 5,
-  "episodeCount": 50
-}
-```
+Other event types are acknowledged but not acted on.
 
 ### POST /sonarr/monitor/wanted
-Fetches wanted/missing episodes from Sonarr, validates stream links, creates `.strm` files for valid links, and triggers a rescan when new files are created. Also runs every 15 minutes via the scheduler.
+Fetches wanted/missing episodes from Sonarr, validates stream links, creates `.strm` files for valid links, and triggers a rescan when new files are created. Also runs on startup and every 15 minutes (configurable) via the scheduler.
 
 **Response:**
 ```json
@@ -177,4 +207,25 @@ Fetches wanted/missing episodes from Sonarr, validates stream links, creates `.s
 }
 ```
 
-For detailed information about the monitor endpoints, see [MONITOR_ENDPOINT.md](MONITOR_ENDPOINT.md).
+### POST /radarr
+Receives Radarr webhooks and processes them based on event type.
+
+**Supported Events:**
+- `movieAdd` - Sets the movie to monitored with the SDTV quality profile, validates the link, removes existing files, creates a `.strm` file, sets the movie unmonitored, and triggers a rescan.
+
+Other event types are acknowledged but not acted on.
+
+### POST /radarr/monitor/wanted
+Fetches wanted/missing movies from Radarr, validates stream links, creates `.strm` files for valid links, and triggers a rescan when new files are created. Also runs on startup and every 15 minutes (configurable) via the scheduler.
+
+**Response:**
+```json
+{
+  "message": "Wanted/missing movies monitoring completed",
+  "seriesProcessed": 5,
+  "episodesProcessed": 5,
+  "episodesWithValidLinks": 4,
+  "strmFilesCreated": 3,
+  "rescansTriggered": 3
+}
+```

@@ -8,7 +8,6 @@ public interface IFileSystemService
     Task WriteAllTextAsync(string path, string content);
     void DeleteFile(string path);
     string[] GetFiles(string path, string searchPattern);
-    void DeleteDirectory(string path, bool recursive);
 }
 
 public class FileSystemService : IFileSystemService
@@ -24,6 +23,4 @@ public class FileSystemService : IFileSystemService
     public void DeleteFile(string path) => File.Delete(path);
     
     public string[] GetFiles(string path, string searchPattern) => Directory.GetFiles(path, searchPattern);
-
-    public void DeleteDirectory(string path, bool recursive) => Directory.Delete(path, recursive);
 }

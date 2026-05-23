@@ -23,42 +23,6 @@ public class RadarrService : IRadarrService
             cancellationToken);
     }
 
-    public async Task<RadarrMovieDetails?> TryGetMovieDetailsAsync(int movieId, CancellationToken cancellationToken = default)
-    {
-        var response = await _apiClient.SendAsync(
-            HttpMethod.Get,
-            $"/api/v3/movie/{movieId}",
-            payload: null,
-            operationName: $"TryGetMovieDetails for movie {movieId}",
-            throwOnError: false,
-            cancellationToken: cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            if (response.StatusCode == HttpStatusCode.NotFound)
-            {
-                _logger.LogInformation("Movie ID {MovieId} not found (skipping)", movieId);
-                return null;
-            }
-
-            _logger.LogWarning("Failed to fetch movie ID {MovieId}: {StatusCode}", movieId, response.StatusCode);
-            return null;
-        }
-
-        var json = await response.Content.ReadAsStringAsync(cancellationToken);
-        return System.Text.Json.JsonSerializer.Deserialize<RadarrMovieDetails>(json);
-    }
-
-    public async Task<List<RadarrMovieDetails>> GetAllMoviesAsync(CancellationToken cancellationToken = default)
-    {
-        var movies = await _apiClient.GetAsync<List<RadarrMovieDetails>>(
-            "/api/v3/movie",
-            "GetAllMovies",
-            cancellationToken: cancellationToken);
-
-        return movies ?? new List<RadarrMovieDetails>();
-    }
-
     public async Task<List<RadarrMovieDetails>> GetWantedMissingMoviesAsync(CancellationToken cancellationToken = default)
     {
         var allMissingMovies = new List<RadarrMovieDetails>();
@@ -117,36 +81,6 @@ public class RadarrService : IRadarrService
         _logger.LogInformation("Successfully updated movie ID {MovieId}", movie.Id);
     }
 
-    public async Task<bool> DeleteMovieAsync(
-        int movieId,
-        bool deleteFiles,
-        bool addImportListExclusion = false,
-        CancellationToken cancellationToken = default)
-    {
-        var endpoint =
-            $"/api/v3/movie/{movieId}?deleteFiles={deleteFiles.ToString().ToLowerInvariant()}&addImportListExclusion={addImportListExclusion.ToString().ToLowerInvariant()}";
-
-        var response = await _apiClient.SendAsync(
-            HttpMethod.Delete,
-            endpoint,
-            payload: null,
-            operationName: $"delete movie {movieId}",
-            throwOnError: false,
-            cancellationToken: cancellationToken);
-
-        if (response.IsSuccessStatusCode)
-        {
-            _logger.LogInformation("Deleted movie ID {MovieId} (deleteFiles={DeleteFiles})", movieId, deleteFiles);
-            return true;
-        }
-
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
-        _logger.LogWarning(
-            "Failed to delete movie ID {MovieId}: {StatusCode} {Body}",
-            movieId, response.StatusCode, body);
-        return false;
-    }
-
     public async Task<bool> DeleteMovieFileAsync(int movieFileId, CancellationToken cancellationToken = default)
     {
         _logger.LogInformation("Deleting movie file ID {MovieFileId}", movieFileId);
@@ -169,31 +103,6 @@ public class RadarrService : IRadarrService
         _logger.LogWarning("Failed to delete movie file ID {MovieFileId}: {StatusCode} {Body}",
             movieFileId, response.StatusCode, body);
         return false;
-    }
-
-    public async Task RefreshMovieAsync(int movieId, CancellationToken cancellationToken = default)
-    {
-        var command = new { name = "RefreshMovie", movieId };
-
-        _logger.LogInformation("Triggering movie refresh for movie ID {MovieId}", movieId);
-
-        var response = await _apiClient.SendAsync(
-            HttpMethod.Post,
-            "/api/v3/command",
-            command,
-            $"refresh movie {movieId}",
-            throwOnError: false,
-            cancellationToken: cancellationToken);
-
-        if (response.IsSuccessStatusCode)
-        {
-            _logger.LogInformation("Successfully triggered movie refresh for movie ID {MovieId}", movieId);
-        }
-        else
-        {
-            _logger.LogWarning("Failed to trigger movie refresh for movie ID {MovieId}: {StatusCode}",
-                movieId, response.StatusCode);
-        }
     }
 
     public async Task RescanMovieAsync(int movieId, CancellationToken cancellationToken = default)

@@ -57,7 +57,7 @@ public class RadarrController : ControllerBase
     }
 
     [HttpPost("monitor/wanted")]
-    [ProducesResponseType<MonitorWantedResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<MonitorWantedMoviesResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ErrorResponse>(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> MonitorWanted()
     {

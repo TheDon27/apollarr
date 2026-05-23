@@ -15,6 +15,8 @@ public class StrmFileService : IStrmFileService
     private readonly StrmSettings _strmSettings;
     private readonly ISonarrService _sonarrService;
     private readonly IRadarrService? _radarrService;
+    private readonly IValidationCache _validationCache;
+    private readonly int _maxConcurrentValidations;
 
     public StrmFileService(
         ILogger<StrmFileService> logger,
@@ -22,15 +24,18 @@ public class StrmFileService : IStrmFileService
         IFileSystemService fileSystem,
         ISonarrService sonarrService,
         IOptions<AppSettings> appSettings,
-        IRadarrService? radarrService = null)
+        IRadarrService? radarrService = null,
+        IValidationCache? validationCache = null)
     {
         _logger = logger;
         _httpClient = httpClient;
         _fileSystem = fileSystem;
         _sonarrService = sonarrService;
         _radarrService = radarrService;
+        _validationCache = validationCache ?? new NullValidationCache();
         _apolloSettings = appSettings.Value.Apollo;
         _strmSettings = appSettings.Value.Strm;
+        _maxConcurrentValidations = Math.Max(1, _strmSettings.MaxConcurrentValidations);
 
         if (string.IsNullOrWhiteSpace(_apolloSettings.Username))
             throw new InvalidOperationException("APOLLO_USERNAME not configured");
@@ -38,50 +43,106 @@ public class StrmFileService : IStrmFileService
             throw new InvalidOperationException("APOLLO_PASSWORD not configured");
     }
 
+    // Runs <paramref name="body"/> over every item with at most _maxConcurrentValidations
+    // in flight. Used to parallelize the per-item link validation that previously ran serially.
+    private async Task ForEachConcurrentAsync<T>(
+        IEnumerable<T> items, Func<T, Task> body, CancellationToken cancellationToken)
+    {
+        using var semaphore = new SemaphoreSlim(_maxConcurrentValidations);
+        var tasks = new List<Task>();
+
+        foreach (var item in items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await semaphore.WaitAsync(cancellationToken);
+
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    await body(item);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }, cancellationToken));
+        }
+
+        await Task.WhenAll(tasks);
+    }
+
+    // Validates a stream URL, consulting the cache first. A cached positive result skips the
+    // HEAD request entirely; live successes are cached. Negative results are never cached so a
+    // link that later becomes available is still picked up on the next pass.
+    private async Task<bool> ValidateLinkCachedAsync(string streamUrl, CancellationToken cancellationToken)
+    {
+        if (await _validationCache.IsValidatedAsync(streamUrl, cancellationToken))
+        {
+            _logger.LogDebug("Stream URL validation served from cache: {StreamUrl}", RedactCredentials(streamUrl));
+            return true;
+        }
+
+        var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
+        if (isValid)
+        {
+            await _validationCache.SetValidatedAsync(streamUrl, cancellationToken);
+        }
+
+        return isValid;
+    }
+
     public async Task<SeriesValidationResult> ProcessSeriesEpisodesAsync(
         SonarrSeriesDetails series, 
         List<Episode> episodes,
         CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("Processing {EpisodeCount} episodes for series: {SeriesTitle} (ID: {SeriesId})", 
+        _logger.LogInformation("Processing {EpisodeCount} episodes for series: {SeriesTitle} (ID: {SeriesId})",
             episodes.Count, series.Title, series.Id);
 
         var episodesProcessed = 0;
         var episodesWithValidLinks = 0;
         var episodesMissing = 0;
+        var strmFilesCreated = 0;
 
-        foreach (var episode in episodes)
+        await ForEachConcurrentAsync(episodes, async episode =>
         {
             try
             {
-                episodesProcessed++;
-                
-                cancellationToken.ThrowIfCancellationRequested();
+                Interlocked.Increment(ref episodesProcessed);
+
+                var strmPath = GetEpisodeStrmPath(series, episode);
+                var existedBefore = _fileSystem.FileExists(strmPath);
 
                 var hasValidLink = await ProcessEpisodeForMonitoringAsync(series, episode, cancellationToken);
-                
+
                 if (hasValidLink)
                 {
-                    episodesWithValidLinks++;
+                    Interlocked.Increment(ref episodesWithValidLinks);
+
+                    if (!existedBefore && _fileSystem.FileExists(strmPath))
+                    {
+                        Interlocked.Increment(ref strmFilesCreated);
+                    }
                 }
                 else
                 {
-                    episodesMissing++;
+                    Interlocked.Increment(ref episodesMissing);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing episode S{Season:D2}E{Episode:D2} for series {SeriesTitle}", 
+                _logger.LogError(ex, "Error processing episode S{Season:D2}E{Episode:D2} for series {SeriesTitle}",
                     episode.SeasonNumber, episode.EpisodeNumber, series.Title);
-                episodesMissing++;
+                Interlocked.Increment(ref episodesMissing);
             }
-        }
+        }, cancellationToken);
 
         _logger.LogInformation(
-            "Completed processing series {SeriesTitle}. Processed: {Processed}, Valid: {Valid}, Missing: {Missing}",
-            series.Title, episodesProcessed, episodesWithValidLinks, episodesMissing);
+            "Completed processing series {SeriesTitle}. Processed: {Processed}, Valid: {Valid}, Missing: {Missing}, STRM created: {StrmCreated}",
+            series.Title, episodesProcessed, episodesWithValidLinks, episodesMissing, strmFilesCreated);
 
-        return new SeriesValidationResult(episodesProcessed, episodesWithValidLinks, episodesMissing);
+        return new SeriesValidationResult(episodesProcessed, episodesWithValidLinks, episodesMissing, strmFilesCreated);
     }
 
     public async Task<MonitorSeriesResponse> ProcessSeriesMonitoringAsync(bool onlyMonitored, CancellationToken cancellationToken = default)
@@ -131,9 +192,14 @@ public class StrmFileService : IStrmFileService
                 episodesWithValidLinks += validationResult.EpisodesWithValidLinks;
                 episodesMissing += validationResult.EpisodesMissing;
 
-                // Trigger rescan so Sonarr imports newly created .strm files
-                await _sonarrService.RescanSeriesAsync(seriesDetails.Id, cancellationToken);
-                rescansTriggered++;
+                // Only rescan when a new .strm was actually created. Rescans are expensive on the
+                // Sonarr side, and the periodic sweep otherwise re-scanned every series every cycle
+                // even when nothing changed. (seriesAdd still rescans unconditionally on first add.)
+                if (validationResult.StrmFilesCreated > 0)
+                {
+                    await _sonarrService.RescanSeriesAsync(seriesDetails.Id, cancellationToken);
+                    rescansTriggered++;
+                }
 
                 seriesProcessed++;
             }
@@ -186,11 +252,11 @@ public class StrmFileService : IStrmFileService
                 continue;
             }
 
-            var createdForSeries = false;
+            var createdForSeries = 0;
 
-            foreach (var episode in seriesGroup)
+            await ForEachConcurrentAsync(seriesGroup, async episode =>
             {
-                episodesProcessed++;
+                Interlocked.Increment(ref episodesProcessed);
 
                 var strmPath = GetEpisodeStrmPath(seriesDetails, episode);
                 var existedBefore = _fileSystem.FileExists(strmPath);
@@ -199,22 +265,17 @@ public class StrmFileService : IStrmFileService
 
                 if (hasValidLink)
                 {
-                    episodesWithValidLinks++;
+                    Interlocked.Increment(ref episodesWithValidLinks);
 
                     if (!existedBefore && _fileSystem.FileExists(strmPath))
                     {
-                        strmFilesCreated++;
-                        createdForSeries = true;
+                        Interlocked.Increment(ref strmFilesCreated);
+                        Interlocked.Increment(ref createdForSeries);
                     }
                 }
+            }, cancellationToken);
 
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    break;
-                }
-            }
-
-            if (createdForSeries)
+            if (createdForSeries > 0)
             {
                 await _sonarrService.RescanSeriesAsync(seriesDetails.Id, cancellationToken);
                 rescansTriggered++;
@@ -236,7 +297,7 @@ public class StrmFileService : IStrmFileService
             rescansTriggered);
     }
 
-    public async Task<MonitorWantedResponse> ProcessWantedMissingMoviesAsync(CancellationToken cancellationToken = default)
+    public async Task<MonitorWantedMoviesResponse> ProcessWantedMissingMoviesAsync(CancellationToken cancellationToken = default)
     {
         if (_radarrService == null)
         {
@@ -252,14 +313,9 @@ public class StrmFileService : IStrmFileService
         var strmFilesCreated = 0;
         var rescansTriggered = 0;
 
-        foreach (var movie in wantedMovies)
+        await ForEachConcurrentAsync(wantedMovies, async movie =>
         {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-
-            moviesProcessed++;
+            Interlocked.Increment(ref moviesProcessed);
 
             var strmPath = GetMovieStrmPath(movie);
             var existedBefore = _fileSystem.FileExists(strmPath);
@@ -268,7 +324,7 @@ public class StrmFileService : IStrmFileService
 
             if (hasValidLink)
             {
-                moviesWithValidLinks++;
+                Interlocked.Increment(ref moviesWithValidLinks);
 
                 // Only rescan if a new .strm file was actually created
                 // This matches Sonarr's behavior: only rescan when a new file needs to be imported
@@ -277,31 +333,25 @@ public class StrmFileService : IStrmFileService
                 // This means if many movies get new .strm files, there will be many rescans.
                 if (!existedBefore && _fileSystem.FileExists(strmPath))
                 {
-                    strmFilesCreated++;
+                    Interlocked.Increment(ref strmFilesCreated);
                     _logger.LogDebug("New .strm file created for movie {MovieTitle} (ID: {MovieId}), triggering rescan", movie.Title, movie.Id);
-                    await _radarrService.RescanMovieAsync(movie.Id, cancellationToken);
-                    rescansTriggered++;
+                    await _radarrService!.RescanMovieAsync(movie.Id, cancellationToken);
+                    Interlocked.Increment(ref rescansTriggered);
                 }
                 else if (existedBefore)
                 {
                     _logger.LogDebug("Skipping rescan for movie {MovieTitle} (ID: {MovieId}) - .strm file already exists", movie.Title, movie.Id);
                 }
             }
-
-            if (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-        }
+        }, cancellationToken);
 
         _logger.LogInformation(
             "Wanted/missing movies monitoring complete. Movies: {MoviesProcessed}, Valid: {ValidLinks}, STRM created: {StrmCreated}, Rescans: {Rescans}",
             moviesProcessed, moviesWithValidLinks, strmFilesCreated, rescansTriggered);
 
-        return new MonitorWantedResponse(
+        return new MonitorWantedMoviesResponse(
             "Wanted/missing movies monitoring completed",
             moviesProcessed,
-            moviesProcessed, // Using moviesProcessed for both series and episodes count for compatibility
             moviesWithValidLinks,
             strmFilesCreated,
             rescansTriggered);
@@ -358,8 +408,8 @@ public class StrmFileService : IStrmFileService
                 .Replace("{password}", _apolloSettings.Password)
                 .Replace("{imdbId}", movie.ImdbId);
 
-            // Validate the stream URL
-            var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
+            // Validate the stream URL (cache hit skips the HEAD request)
+            var isValid = await ValidateLinkCachedAsync(streamUrl, cancellationToken);
 
             if (!isValid)
             {
@@ -487,181 +537,6 @@ public class StrmFileService : IStrmFileService
         return updatesApplied;
     }
 
-    public async Task<MonitorSeasonsResponse> ProcessSeasonsMonitoringAsync(bool onlyMonitored, CancellationToken cancellationToken = default)
-    {
-        _logger.LogInformation("Starting seasons monitoring check, onlyMonitored: {OnlyMonitored}", onlyMonitored);
-
-        var allSeries = await _sonarrService.GetAllSeriesAsync(cancellationToken);
-        var seriesProcessed = 0;
-        var seasonsProcessed = 0;
-
-        foreach (var series in allSeries)
-        {
-            try
-            {
-                _logger.LogInformation("Processing seasons for series: {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
-                
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var episodes = await _sonarrService.GetEpisodesForSeriesAsync(series.Id, cancellationToken);
-
-                foreach (var season in series.Seasons)
-                {
-                    // Skip specials (season 0) if needed
-                    if (season.SeasonNumber == 0)
-                        continue;
-
-                    var seasonEpisodes = episodes.Where(e => e.SeasonNumber == season.SeasonNumber).ToList();
-                    if (seasonEpisodes.Count == 0)
-                        continue;
-
-                    var shouldBeMonitored = await DetermineSeasonMonitoringStatusAsync(series, season, seasonEpisodes);
-                    
-                    if (season.Monitored != shouldBeMonitored)
-                    {
-                        _logger.LogDebug(
-                            "Skipping monitoring change for season {SeasonNumber} of {SeriesTitle} (current={Current}, desired={Desired})", 
-                            season.SeasonNumber, series.Title, season.Monitored, shouldBeMonitored);
-                    }
-                    seasonsProcessed++;
-                }
-
-                seriesProcessed++;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error processing seasons for series {SeriesTitle} (ID: {SeriesId})", 
-                    series.Title, series.Id);
-            }
-        }
-
-        _logger.LogInformation(
-            "Seasons monitoring check complete (no status changes applied). Series: {SeriesProcessed}, Seasons: {SeasonsProcessed}",
-            seriesProcessed, seasonsProcessed);
-
-        return new MonitorSeasonsResponse(
-            "Seasons monitoring check completed",
-            seriesProcessed,
-            seasonsProcessed);
-    }
-
-    private async Task<bool> DetermineSeasonMonitoringStatusAsync(
-        SonarrSeriesDetails series, 
-        SeasonDetails season, 
-        List<Episode> seasonEpisodes)
-    {
-        // Season should be monitored UNLESS:
-        // 1. All episodes in the season have .strm files
-        // 2. All episodes in the season are unmonitored
-
-        if (seasonEpisodes.Count == 0)
-            return false;
-
-        // Check if all episodes are unmonitored
-        var allUnmonitored = seasonEpisodes.All(e => !e.Monitored);
-        if (!allUnmonitored)
-        {
-            _logger.LogDebug("Season {SeasonNumber} of {SeriesTitle} has monitored episodes, should be monitored", 
-                season.SeasonNumber, series.Title);
-            return true;
-        }
-
-        // Check if all episodes have .strm files
-        var allHaveStrmFiles = true;
-        foreach (var episode in seasonEpisodes)
-        {
-            var seasonPath = GetSeasonPath(series, episode.SeasonNumber);
-            if (!_fileSystem.DirectoryExists(seasonPath))
-            {
-                allHaveStrmFiles = false;
-                break;
-            }
-
-            var strmFilePath = GetEpisodeStrmPath(series, episode);
-
-            if (!_fileSystem.FileExists(strmFilePath))
-            {
-                allHaveStrmFiles = false;
-                break;
-            }
-        }
-
-        if (!allHaveStrmFiles)
-        {
-            _logger.LogDebug("Season {SeasonNumber} of {SeriesTitle} is missing .strm files, should be monitored", 
-                season.SeasonNumber, series.Title);
-            return true;
-        }
-
-        // All episodes are unmonitored and have .strm files
-        _logger.LogInformation("Season {SeasonNumber} of {SeriesTitle} has all episodes with .strm files and unmonitored, should be unmonitored", 
-            season.SeasonNumber, series.Title);
-        return false;
-    }
-
-    private async Task<bool> DetermineSeriesMonitoringStatusAsync(SonarrSeriesDetails series, List<Episode> episodes)
-    {
-        // Series should be monitored UNLESS:
-        // 1. Series is ended
-        // 2. All episodes (excluding specials) have .strm files
-        // 3. All episodes (excluding specials) are unmonitored
-
-        // Check if series is ended
-        if (!series.Ended && !series.Status?.Equals("ended", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            _logger.LogDebug("Series {SeriesTitle} is continuing, should be monitored", series.Title);
-            return true;
-        }
-
-        // Series is ended - check episodes
-        var regularEpisodes = episodes.Where(e => e.SeasonNumber > 0).ToList();
-        
-        if (regularEpisodes.Count == 0)
-        {
-            _logger.LogDebug("Series {SeriesTitle} has no regular episodes, should be monitored", series.Title);
-            return true;
-        }
-
-        // Check if all episodes are unmonitored
-        var allUnmonitored = regularEpisodes.All(e => !e.Monitored);
-        if (!allUnmonitored)
-        {
-            _logger.LogDebug("Series {SeriesTitle} has monitored episodes, should be monitored", series.Title);
-            return true;
-        }
-
-        // Check if all episodes have .strm files
-        var allHaveStrmFiles = true;
-        foreach (var episode in regularEpisodes)
-        {
-            var seasonPath = GetSeasonPath(series, episode.SeasonNumber);
-            if (!_fileSystem.DirectoryExists(seasonPath))
-            {
-                allHaveStrmFiles = false;
-                break;
-            }
-
-            var strmFilePath = GetEpisodeStrmPath(series, episode);
-
-            if (!_fileSystem.FileExists(strmFilePath))
-            {
-                allHaveStrmFiles = false;
-                break;
-            }
-        }
-
-        if (!allHaveStrmFiles)
-        {
-            _logger.LogDebug("Series {SeriesTitle} is missing .strm files, should be monitored", series.Title);
-            return true;
-        }
-
-        // Series is ended, all episodes are unmonitored, and all have .strm files
-        _logger.LogInformation("Series {SeriesTitle} is ended with all episodes unmonitored and having .strm files, should be unmonitored", 
-            series.Title);
-        return false;
-    }
-
     private async Task<bool> ProcessEpisodeForMonitoringAsync(
         SonarrSeriesDetails series, Episode episode, CancellationToken cancellationToken)
     {
@@ -683,8 +558,8 @@ public class StrmFileService : IStrmFileService
                 .Replace("{season}", episode.SeasonNumber.ToString())
                 .Replace("{episode}", episode.EpisodeNumber.ToString());
 
-            // Validate the stream URL
-            var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
+            // Validate the stream URL (cache hit skips the HEAD request)
+            var isValid = await ValidateLinkCachedAsync(streamUrl, cancellationToken);
 
         if (!isValid)
         {
@@ -787,139 +662,8 @@ public class StrmFileService : IStrmFileService
         }
     }
 
-    public async Task CreateStrmFilesForSeriesAsync(SonarrSeriesDetails series, List<Episode> episodes, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            _logger.LogInformation("Processing episodes for series: {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
-            _logger.LogInformation("Series path: {SeriesPath}", series.Path);
-            _logger.LogInformation("Total episodes to process: {EpisodeCount}", episodes.Count);
-
-            // Group episodes by season
-            var episodesBySeason = episodes
-                .GroupBy(e => e.SeasonNumber)
-                .OrderBy(g => g.Key);
-
-            foreach (var seasonGroup in episodesBySeason)
-            {
-                var seasonNumber = seasonGroup.Key;
-                var seasonPath = Path.Combine(series.Path, $"Season {seasonNumber:D2}");
-
-                // Create season directory if it doesn't exist
-                if (!_fileSystem.DirectoryExists(seasonPath))
-                {
-                    _fileSystem.CreateDirectory(seasonPath);
-                    _logger.LogInformation("Created season directory: {SeasonPath}", seasonPath);
-                }
-
-                foreach (var episode in seasonGroup.OrderBy(e => e.EpisodeNumber))
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    await ProcessEpisodeAsync(series, episode, seasonPath, cancellationToken);
-                }
-            }
-
-            _logger.LogInformation("Completed processing episodes for series: {SeriesTitle}", series.Title);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing episodes for series: {SeriesTitle} (ID: {SeriesId})", series.Title, series.Id);
-            throw;
-        }
-    }
-
-    private async Task ProcessEpisodeAsync(SonarrSeriesDetails series, Episode episode, string seasonPath, CancellationToken cancellationToken)
-    {
-        try
-        {
-            // Get expected .strm filename
-            var strmFilePath = GetEpisodeStrmPath(series, episode);
-
-            // Check if .strm file exists
-            var strmFileExists = _fileSystem.FileExists(strmFilePath);
-
-            if (strmFileExists)
-            {
-                _logger.LogDebug(".strm file exists for S{Season:D2}E{Episode:D2}, no monitoring needed", 
-                    episode.SeasonNumber, episode.EpisodeNumber);
-                
-                return;
-            }
-
-            // No .strm file exists - check if episode has a file
-            if (episode.HasFile && episode.EpisodeFileId > 0)
-            {
-                _logger.LogInformation("Episode S{Season:D2}E{Episode:D2} has existing file (ID: {FileId}), deleting to replace with .strm", 
-                    episode.SeasonNumber, episode.EpisodeNumber, episode.EpisodeFileId);
-                
-                cancellationToken.ThrowIfCancellationRequested();
-
-                await _sonarrService.DeleteEpisodeFileAsync(episode.EpisodeFileId, cancellationToken);
-                episode.HasFile = false;
-                episode.EpisodeFileId = 0;
-            }
-
-            // Create .strm file
-            await CreateStrmFileForEpisodeAsync(series, episode, seasonPath, strmFilePath, cancellationToken);
-
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing episode S{Season:D2}E{Episode:D2}", 
-                episode.SeasonNumber, episode.EpisodeNumber);
-            
-            _logger.LogWarning("Leaving monitoring state unchanged for episode S{Season:D2}E{Episode:D2} due to error", 
-                episode.SeasonNumber, episode.EpisodeNumber);
-        }
-    }
-
-    private async Task CreateStrmFileForEpisodeAsync(SonarrSeriesDetails series, Episode episode, string seasonPath, string filePath, CancellationToken cancellationToken)
-    {
-        // Validate that we have an IMDb ID
-        if (string.IsNullOrWhiteSpace(series.ImdbId))
-        {
-            _logger.LogWarning("Series {SeriesTitle} (ID: {SeriesId}) does not have an IMDb ID, skipping episode S{Season:D2}E{Episode:D2}", 
-                series.Title, series.Id, episode.SeasonNumber, episode.EpisodeNumber);
-            throw new InvalidOperationException($"Series {series.Title} does not have an IMDb ID");
-        }
-
-        // Create streaming URL using template
-        var streamUrl = _strmSettings.StreamUrlTemplate
-            .Replace("{username}", _apolloSettings.Username)
-            .Replace("{password}", _apolloSettings.Password)
-            .Replace("{imdbId}", series.ImdbId)
-            .Replace("{season}", episode.SeasonNumber.ToString())
-            .Replace("{episode}", episode.EpisodeNumber.ToString());
-
-        // Validate the stream URL before creating the file if enabled
-        if (_strmSettings.ValidateUrls)
-        {
-            var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
-            if (!isValid)
-            {
-                _logger.LogWarning("Stream URL is not valid for {SeriesTitle} S{Season:D2}E{Episode:D2}, skipping .strm file creation", 
-                    series.Title, episode.SeasonNumber, episode.EpisodeNumber);
-                throw new InvalidOperationException($"Stream URL is not valid for S{episode.SeasonNumber:D2}E{episode.EpisodeNumber:D2}");
-            }
-        }
-
-        // Write the stream URL to the .strm file
-        await _fileSystem.WriteAllTextAsync(filePath, streamUrl);
-
-        _logger.LogInformation("Created .strm file: {FilePath}", filePath);
-    }
-
     private string GetSeasonPath(SonarrSeriesDetails series, int seasonNumber) =>
         Path.Combine(series.Path, $"Season {seasonNumber:D2}");
-
-    private List<Episode> FilterEpisodes(List<Episode> episodes, bool onlyMonitored)
-    {
-        var filtered = onlyMonitored
-            ? episodes.Where(e => e.Monitored)
-            : episodes.AsEnumerable();
-
-        return filtered.ToList();
-    }
 
     private string GetEpisodeStrmPath(SonarrSeriesDetails series, Episode episode)
     {
@@ -958,7 +702,7 @@ public class StrmFileService : IStrmFileService
             // Validate the stream URL before creating the file if enabled
             if (_strmSettings.ValidateUrls)
             {
-                var isValid = await ValidateStreamUrlAsync(streamUrl, cancellationToken);
+                var isValid = await ValidateLinkCachedAsync(streamUrl, cancellationToken);
                 if (!isValid)
                 {
                     _logger.LogWarning("Stream URL is not valid for {MovieTitle}, skipping .strm file creation", movie.Title);
@@ -1012,7 +756,7 @@ public class StrmFileService : IStrmFileService
     {
         try
         {
-            _logger.LogDebug("Validating stream URL: {StreamUrl}", streamUrl);
+            _logger.LogDebug("Validating stream URL: {StreamUrl}", RedactCredentials(streamUrl));
 
             using var validationTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_strmSettings.ValidationTimeoutSeconds));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, validationTimeoutCts.Token);
@@ -1023,36 +767,52 @@ public class StrmFileService : IStrmFileService
             var finalUrl = response.RequestMessage?.RequestUri?.ToString() ?? streamUrl;
             if (finalUrl.Contains("error.starlite.best"))
             {
-                _logger.LogWarning("Stream URL redirected to error page: {ErrorUrl}", finalUrl);
+                _logger.LogWarning("Stream URL redirected to error page: {ErrorUrl}", RedactCredentials(finalUrl));
                 return false;
             }
 
             // If we get a successful response, the URL is valid
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogDebug("Stream URL is valid: {StreamUrl}", streamUrl);
+                _logger.LogDebug("Stream URL is valid: {StreamUrl}", RedactCredentials(streamUrl));
                 return true;
             }
 
-            _logger.LogWarning("Stream URL returned status code {StatusCode}: {StreamUrl}", response.StatusCode, streamUrl);
+            _logger.LogWarning("Stream URL returned status code {StatusCode}: {StreamUrl}", response.StatusCode, RedactCredentials(streamUrl));
             return false;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _logger.LogWarning("Stream URL validation canceled: {StreamUrl}", streamUrl);
+            _logger.LogWarning("Stream URL validation canceled: {StreamUrl}", RedactCredentials(streamUrl));
             throw;
         }
         catch (OperationCanceledException)
         {
-            _logger.LogWarning("Stream URL validation timed out after {Timeout}s: {StreamUrl}", 
-                _strmSettings.ValidationTimeoutSeconds, streamUrl);
+            _logger.LogWarning("Stream URL validation timed out after {Timeout}s: {StreamUrl}",
+                _strmSettings.ValidationTimeoutSeconds, RedactCredentials(streamUrl));
             return false;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error validating stream URL: {StreamUrl}", streamUrl);
+            _logger.LogError(ex, "Error validating stream URL: {StreamUrl}", RedactCredentials(streamUrl));
             return false;
         }
+    }
+
+    // Replaces the configured Apollo username/password with a placeholder so credentials
+    // embedded in stream URLs never reach logs.
+    private string RedactCredentials(string url)
+    {
+        if (string.IsNullOrEmpty(url))
+            return url;
+
+        var redacted = url;
+        if (!string.IsNullOrEmpty(_apolloSettings.Username))
+            redacted = redacted.Replace(_apolloSettings.Username, "***");
+        if (!string.IsNullOrEmpty(_apolloSettings.Password))
+            redacted = redacted.Replace(_apolloSettings.Password, "***");
+
+        return redacted;
     }
 
     public static string GetEpisodeTitle(Episode episode)

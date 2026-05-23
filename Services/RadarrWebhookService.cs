@@ -141,6 +141,6 @@ public class RadarrWebhookService : IRadarrWebhookService
             movieDetails.Title);
     }
 
-    public Task<MonitorWantedResponse> MonitorWantedAsync(CancellationToken cancellationToken = default) =>
+    public Task<MonitorWantedMoviesResponse> MonitorWantedAsync(CancellationToken cancellationToken = default) =>
         _strmFileService.ProcessWantedMissingMoviesAsync(cancellationToken);
 }
